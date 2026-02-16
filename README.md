@@ -127,7 +127,7 @@ fire ssh myvm "uname -a"
 # internet works out of the box (via proxy)
 fire ssh myvm "curl -s https://example.com | head -5"
 
-# apt works too
+# apt uses apt-fast + aria2 under the hood (16 parallel connections)
 fire ssh myvm "apt-get update && apt-get install -y htop"
 
 # spin up multiple VMs
@@ -225,6 +225,7 @@ the base rootfs is ubuntu 24.04 converted from squashfs (firecracker CI) to ext4
 - DNS resolver → dnsmasq on host tap
 - proxy env vars → tinyproxy on host tap
 - root password: `root` (SSH enabled)
+- `apt-fast` + `aria2` (parallel package downloads — transparently replaces `apt`/`apt-get`)
 
 disk can be grown after creation via `fire resize <name> --disk N`. shrinking is not supported (too dangerous for ext4).
 

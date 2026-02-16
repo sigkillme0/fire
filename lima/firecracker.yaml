@@ -110,6 +110,59 @@ provision:
         mkdir -p /tmp/rootfs_mount/etc/ssh/sshd_config.d
         echo 'PermitRootLogin yes' > /tmp/rootfs_mount/etc/ssh/sshd_config.d/99-firecracker.conf
 
+        # --- apt-fast + aria2: nuke vanilla apt, parallel downloads ----
+        # chroot into rootfs to install aria2, then drop apt-fast on top
+        mount --bind /proc /tmp/rootfs_mount/proc
+        mount --bind /sys /tmp/rootfs_mount/sys
+        mount --bind /dev /tmp/rootfs_mount/dev
+        mount -t tmpfs tmpfs /tmp/rootfs_mount/tmp
+        cp /etc/resolv.conf /tmp/rootfs_mount/etc/resolv.conf
+
+        chroot /tmp/rootfs_mount /bin/bash -c "
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update -qq
+          apt-get install -y -qq aria2 > /dev/null
+          apt-get clean
+          rm -rf /var/lib/apt/lists/*
+        "
+
+        # install apt-fast from upstream (it's just a shell script)
+        curl -sL https://raw.githubusercontent.com/ilikenwf/apt-fast/master/apt-fast \
+          -o /tmp/rootfs_mount/usr/local/bin/apt-fast
+        chmod +x /tmp/rootfs_mount/usr/local/bin/apt-fast
+
+        # apt-fast config — 16 parallel connections, aggressive splitting
+        cat > /tmp/rootfs_mount/etc/apt-fast.conf <<'APTFAST'
+_APTMGR=/usr/bin/apt-get
+DOWNLOADBEFORE=true
+_MAXNUM=16
+_MAXCONPERSRV=16
+_SPLITCON=8
+_MINSPLITSZ=1M
+DLLIST='/tmp/apt-fast.list'
+_DOWNLOADER='aria2c --no-conf -c -j ${_MAXNUM} -x ${_MAXCONPERSRV} -s ${_SPLITCON} --min-split-size=${_MINSPLITSZ} --stream-piece-selector=default -i ${DLLIST} --connect-timeout=600 --timeout=600 -m0 --header "Accept: */*"'
+APTFAST
+
+        # shadow apt-get and apt via /usr/local/bin (PATH precedence over /usr/bin)
+        cat > /tmp/rootfs_mount/usr/local/bin/apt-get <<'WRAPPER'
+#!/bin/bash
+exec /usr/local/bin/apt-fast "$@"
+WRAPPER
+        chmod +x /tmp/rootfs_mount/usr/local/bin/apt-get
+
+        cat > /tmp/rootfs_mount/usr/local/bin/apt <<'WRAPPER'
+#!/bin/bash
+exec /usr/local/bin/apt-fast "$@"
+WRAPPER
+        chmod +x /tmp/rootfs_mount/usr/local/bin/apt
+
+        # clean up chroot bind mounts
+        umount /tmp/rootfs_mount/tmp
+        umount /tmp/rootfs_mount/proc
+        umount /tmp/rootfs_mount/sys
+        umount /tmp/rootfs_mount/dev
+        rm -f /tmp/rootfs_mount/etc/resolv.conf
+
         umount /tmp/rootfs_mount
         rm -rf /tmp/rootfs_dir /tmp/ubuntu.squashfs /tmp/rootfs_mount
       fi
