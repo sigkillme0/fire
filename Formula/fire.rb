@@ -2,7 +2,7 @@ class Fire < Formula
   desc "Run Firecracker microVMs on macOS Apple Silicon via Lima"
   homepage "https://github.com/sigkillme0/firecracker-macos"
   url "https://github.com/sigkillme0/firecracker-macos/archive/refs/tags/v1.0.0.tar.gz"
-  sha256 "PLACEHOLDER_SHA256"
+  sha256 "3ff46dfd52fcf668d045c69bafd0417c8307024c771a2b6a2d7d25f8b24771a8"
   license "MIT"
   head "https://github.com/sigkillme0/firecracker-macos.git", branch: "main"
 
