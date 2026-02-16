@@ -1,0 +1,1007 @@
+#!/usr/bin/env bash
+#
+# fcctl - firecracker microVM management for lima
+# runs inside the lima VM where /dev/kvm lives
+#
+set -euo pipefail
+
+readonly KERNEL="/opt/firecracker/vmlinux"
+readonly BASE_ROOTFS="/opt/firecracker/rootfs.ext4"
+readonly VM_DIR="/srv/firecracker"
+readonly TINYPROXY_DIR="/etc/tinyproxy"
+readonly BOOT_ARGS="console=ttyS0 reboot=k panic=1 pci=off init=/sbin/init"
+readonly PROXY_BASE_PORT=8888
+readonly PING_TIMEOUT=120
+
+# --- defaults ---------------------------------------------------------
+
+readonly DEFAULT_VCPUS=2
+readonly DEFAULT_MEM=512
+readonly DEFAULT_DISK=2048
+
+# --- resource safety margins ------------------------------------------
+# these are non-negotiable. violating them = OOM, disk full, or worse.
+
+readonly LIMA_OS_RESERVE_MIB=1024     # 1G for lima kernel + systemd + dnsmasq + tinyproxy
+readonly LIMA_DISK_RESERVE_MIB=5120   # 5G for kernel image + base rootfs + apt cache + system
+readonly MIN_VM_CPUS=1
+readonly MIN_VM_MEM_MIB=128
+readonly MIN_VM_DISK_MIB=256
+
+# --- colors -----------------------------------------------------------
+
+readonly RED=$'\033[0;31m'
+readonly GREEN=$'\033[0;32m'
+readonly YELLOW=$'\033[0;33m'
+readonly CYAN=$'\033[0;36m'
+readonly BOLD=$'\033[1m'
+readonly DIM=$'\033[2m'
+readonly RESET=$'\033[0m'
+
+log()  { printf "${CYAN}▸${RESET} %s\n" "$*"; }
+ok()   { printf "${GREEN}✓${RESET} %s\n" "$*"; }
+warn() { printf "${YELLOW}⚠${RESET} %s\n" "$*" >&2; }
+err()  { printf "${RED}✗${RESET} %s\n" "$*" >&2; }
+die()  { err "$*"; exit 1; }
+
+# --- helpers ----------------------------------------------------------
+
+derive_vm_id() {
+  local hash
+  hash=$(printf '%s' "$1" | cksum | awk '{print $1}')
+  echo $(( (hash % 253) + 1 ))
+}
+
+vm_exists() { [ -d "${VM_DIR}/$1" ] && [ -f "${VM_DIR}/$1/metadata" ]; }
+
+is_running() {
+  local pidfile="${VM_DIR}/${1}/pid"
+  [ -f "$pidfile" ] && kill -0 "$(cat "$pidfile")" 2>/dev/null
+}
+
+get_meta() {
+  { grep "^${2}=" "${VM_DIR}/${1}/metadata" 2>/dev/null || true; } | cut -d= -f2-
+}
+
+set_meta() {
+  local name="$1" key="$2" val="$3"
+  local file="${VM_DIR}/${name}/metadata"
+  if grep -q "^${key}=" "$file" 2>/dev/null; then
+    sed -i "s|^${key}=.*|${key}=${val}|" "$file"
+  else
+    echo "${key}=${val}" >> "$file"
+  fi
+}
+
+host_ip()    { echo "172.16.$1.1"; }
+guest_ip()   { echo "172.16.$1.2"; }
+tap_name()   { echo "tap$1"; }
+proxy_port() { echo $(( PROXY_BASE_PORT + $1 )); }
+mac_addr()   { printf 'AA:FC:00:00:00:%02X' "$1"; }
+
+is_int() { [[ "$1" =~ ^[0-9]+$ ]]; }
+
+ensure_kvm() {
+  [ -e /dev/kvm ] || die "/dev/kvm not found — nested virtualization not available"
+  if [ ! -w /dev/kvm ]; then
+    chmod 666 /dev/kvm 2>/dev/null || die "/dev/kvm not writable — run: sudo chmod 666 /dev/kvm"
+  fi
+}
+
+# --- resource accounting ----------------------------------------------
+# the core constraint solver. every allocation flows through here.
+
+lima_total_cpus()    { nproc; }
+lima_total_mem_mib() { free -m | awk '/^Mem:/{print $2}'; }
+lima_total_disk_mib() {
+  df -m /srv 2>/dev/null | awk 'NR==2{print $2}' || df -m / | awk 'NR==2{print $2}'
+}
+lima_free_disk_mib() {
+  df -m /srv 2>/dev/null | awk 'NR==2{print $4}' || df -m / | awk 'NR==2{print $4}'
+}
+
+# sum allocations across all VMs, optionally excluding one by name
+sum_allocated() {
+  local field="$1" exclude="${2:-}"
+  local total=0
+  for dir in "${VM_DIR}"/*/; do
+    [ -d "$dir" ] || continue
+    local n; n=$(basename "$dir")
+    [ -f "${dir}/metadata" ] || continue
+    [ "$n" = "$exclude" ] && continue
+    local v; v=$(get_meta "$n" "$field")
+    [ -n "$v" ] && total=$((total + v))
+  done
+  echo "$total"
+}
+
+# get apparent file size in MiB (not allocated blocks — sparse files report full size)
+file_size_mib() {
+  local bytes
+  bytes=$(stat --format='%s' "$1" 2>/dev/null) || bytes=0
+  echo $(( bytes / 1048576 ))
+}
+
+# get disk size of a VM's rootfs in MiB
+vm_disk_mib() {
+  local rootfs="${VM_DIR}/${1}/rootfs.ext4"
+  if [ -f "$rootfs" ]; then
+    file_size_mib "$rootfs"
+  else
+    echo 0
+  fi
+}
+
+sum_allocated_disk_mib() {
+  local exclude="${1:-}"
+  local total=0
+  for dir in "${VM_DIR}"/*/; do
+    [ -d "$dir" ] || continue
+    local n; n=$(basename "$dir")
+    [ -f "${dir}/metadata" ] || continue
+    [ "$n" = "$exclude" ] && continue
+    local rootfs="${dir}/rootfs.ext4"
+    if [ -f "$rootfs" ]; then
+      local sz; sz=$(file_size_mib "$rootfs")
+      total=$((total + sz))
+    fi
+  done
+  echo "$total"
+}
+
+available_mem_mib() {
+  local exclude="${1:-}"
+  local total; total=$(lima_total_mem_mib)
+  local used; used=$(sum_allocated "mem" "$exclude")
+  echo $(( total - LIMA_OS_RESERVE_MIB - used ))
+}
+
+available_disk_mib() {
+  local exclude="${1:-}"
+  local free_disk; free_disk=$(lima_free_disk_mib)
+  local alloc; alloc=$(sum_allocated_disk_mib "$exclude")
+  # free disk already accounts for used space, so just report it
+  echo "$free_disk"
+}
+
+# --- budget check -----------------------------------------------------
+# returns 0 if allocation fits, dies with explanation if not.
+# exclude_name: exclude this VM from "already allocated" sums (for resize).
+
+check_budget() {
+  local want_cpus="$1" want_mem="$2" want_disk="$3" exclude="${4:-}"
+  local errors=0
+
+  # --- validate minimums ---
+  if [ "$want_cpus" -lt "$MIN_VM_CPUS" ]; then
+    err "cpus=${want_cpus} below minimum (${MIN_VM_CPUS})"
+    errors=$((errors + 1))
+  fi
+  if [ "$want_mem" -lt "$MIN_VM_MEM_MIB" ]; then
+    err "mem=${want_mem}M below minimum (${MIN_VM_MEM_MIB}M)"
+    errors=$((errors + 1))
+  fi
+  if [ "$want_disk" -lt "$MIN_VM_DISK_MIB" ]; then
+    err "disk=${want_disk}M below minimum (${MIN_VM_DISK_MIB}M)"
+    errors=$((errors + 1))
+  fi
+
+  # --- memory: hard constraint ---
+  local lima_mem; lima_mem=$(lima_total_mem_mib)
+  local allocated_mem; allocated_mem=$(sum_allocated "mem" "$exclude")
+  local ceiling=$(( lima_mem - LIMA_OS_RESERVE_MIB ))
+  local after=$(( allocated_mem + want_mem ))
+
+  if [ "$after" -gt "$ceiling" ]; then
+    local avail=$(( ceiling - allocated_mem ))
+    [ "$avail" -lt 0 ] && avail=0
+    err "OOM: requesting ${want_mem}M but only ${avail}M available"
+    err "  lima total: ${lima_mem}M, reserved: ${LIMA_OS_RESERVE_MIB}M, allocated: ${allocated_mem}M, ceiling: ${ceiling}M"
+    errors=$((errors + 1))
+  fi
+
+  # --- disk: hard constraint ---
+  local free_disk; free_disk=$(lima_free_disk_mib)
+  # for resize, we get back space from the excluded VM
+  if [ -n "$exclude" ] && vm_exists "$exclude"; then
+    local old_disk; old_disk=$(vm_disk_mib "$exclude")
+    free_disk=$((free_disk + old_disk))
+  fi
+
+  if [ "$want_disk" -gt "$free_disk" ]; then
+    err "DISK FULL: requesting ${want_disk}M but only ${free_disk}M free"
+    errors=$((errors + 1))
+  fi
+
+  # --- cpu: soft constraint (warn on overcommit) ---
+  local lima_cpus; lima_cpus=$(lima_total_cpus)
+  local allocated_cpus; allocated_cpus=$(sum_allocated "vcpus" "$exclude")
+  local after_cpus=$(( allocated_cpus + want_cpus ))
+
+  if [ "$after_cpus" -gt "$lima_cpus" ]; then
+    warn "cpu overcommit: ${after_cpus} vCPUs across VMs but lima has ${lima_cpus} cores"
+  fi
+
+  [ "$errors" -gt 0 ] && die "resource budget exceeded — cannot proceed"
+  return 0
+}
+
+# --- tap device -------------------------------------------------------
+
+create_tap() {
+  local vm_id="$1"
+  local tap; tap=$(tap_name "$vm_id")
+  local hip; hip=$(host_ip "$vm_id")
+
+  if ip link show "$tap" &>/dev/null; then
+    return 0
+  fi
+
+  log "creating tap device ${tap}"
+  ip tuntap add dev "$tap" mode tap
+  ip addr add "${hip}/30" dev "$tap"
+  ip link set "$tap" up
+  sysctl -w net.ipv4.ip_forward=1 &>/dev/null
+}
+
+destroy_tap() {
+  local vm_id="$1"
+  local tap; tap=$(tap_name "$vm_id")
+  if ip link show "$tap" &>/dev/null; then
+    ip link set "$tap" down 2>/dev/null || true
+    ip tuntap del dev "$tap" mode tap 2>/dev/null || true
+  fi
+}
+
+# --- dnsmasq ----------------------------------------------------------
+
+start_dnsmasq() {
+  local vm_id="$1"
+  local tap; tap=$(tap_name "$vm_id")
+  local hip; hip=$(host_ip "$vm_id")
+  local pidfile="/run/dnsmasq-${tap}.pid"
+
+  if [ -f "$pidfile" ] && kill -0 "$(cat "$pidfile")" 2>/dev/null; then
+    return 0
+  fi
+
+  log "starting dnsmasq on ${tap} (${hip}:53)"
+  dnsmasq \
+    --listen-address="$hip" \
+    --bind-dynamic \
+    --except-interface=lo \
+    --no-dhcp-interface="$tap" \
+    --server=8.8.8.8 \
+    --server=8.8.4.4 \
+    --pid-file="$pidfile" \
+    --log-facility=/dev/null \
+    --no-resolv \
+    --no-hosts
+}
+
+stop_dnsmasq() {
+  local vm_id="$1"
+  local tap; tap=$(tap_name "$vm_id")
+  local pidfile="/run/dnsmasq-${tap}.pid"
+  if [ -f "$pidfile" ]; then
+    kill "$(cat "$pidfile")" 2>/dev/null || true
+    rm -f "$pidfile"
+  fi
+}
+
+# --- tinyproxy --------------------------------------------------------
+
+start_tinyproxy() {
+  local vm_id="$1"
+  local tap; tap=$(tap_name "$vm_id")
+  local hip; hip=$(host_ip "$vm_id")
+  local port; port=$(proxy_port "$vm_id")
+  local conf="${TINYPROXY_DIR}/tinyproxy-${tap}.conf"
+  local pidfile="/run/tinyproxy-${tap}.pid"
+
+  if [ -f "$pidfile" ] && kill -0 "$(cat "$pidfile")" 2>/dev/null; then
+    return 0
+  fi
+
+  log "starting tinyproxy on ${hip}:${port}"
+
+  mkdir -p "$TINYPROXY_DIR"
+  cat > "$conf" <<EOF
+Port ${port}
+Listen ${hip}
+Allow 172.16.0.0/16
+Timeout 600
+MaxClients 100
+EOF
+
+  tinyproxy -c "$conf" 2>/dev/null
+  sleep 0.2
+  pgrep -f "tinyproxy -c ${conf}" > "$pidfile" 2>/dev/null || true
+}
+
+stop_tinyproxy() {
+  local vm_id="$1"
+  local tap; tap=$(tap_name "$vm_id")
+  local pidfile="/run/tinyproxy-${tap}.pid"
+  local conf="${TINYPROXY_DIR}/tinyproxy-${tap}.conf"
+  if [ -f "$pidfile" ]; then
+    kill "$(cat "$pidfile")" 2>/dev/null || true
+    rm -f "$pidfile"
+  fi
+  # kill any orphan matching this tap's config (catches processes from old fcctl versions)
+  pkill -f "tinyproxy.*tinyproxy-${tap}\\.conf" 2>/dev/null || true
+  rm -f "$conf"
+}
+
+# --- rootfs setup -----------------------------------------------------
+
+configure_rootfs() {
+  local name="$1" vm_id="$2"
+  local rootfs="${VM_DIR}/${name}/rootfs.ext4"
+  local hip; hip=$(host_ip "$vm_id")
+  local gip; gip=$(guest_ip "$vm_id")
+  local port; port=$(proxy_port "$vm_id")
+  local mnt; mnt=$(mktemp -d)
+
+  mount "$rootfs" "$mnt"
+
+  echo "$name" > "${mnt}/etc/hostname"
+  sed -i "/^127\.0\.1\.1/d" "${mnt}/etc/hosts" 2>/dev/null || true
+  echo "127.0.1.1 ${name}" >> "${mnt}/etc/hosts"
+
+  mkdir -p "${mnt}/etc/systemd/network"
+  cat > "${mnt}/etc/systemd/network/20-eth0.network" <<EOF
+[Match]
+Name=eth0
+
+[Network]
+Address=${gip}/30
+Gateway=${hip}
+DNS=${hip}
+EOF
+
+  rm -f "${mnt}/etc/resolv.conf"
+  echo "nameserver ${hip}" > "${mnt}/etc/resolv.conf"
+
+  cat > "${mnt}/etc/environment" <<EOF
+http_proxy=http://${hip}:${port}
+https_proxy=http://${hip}:${port}
+HTTP_PROXY=http://${hip}:${port}
+HTTPS_PROXY=http://${hip}:${port}
+no_proxy=localhost,127.0.0.1,${hip}
+EOF
+
+  mkdir -p "${mnt}/etc/systemd/system/multi-user.target.wants"
+  ln -sf /lib/systemd/system/systemd-networkd.service \
+    "${mnt}/etc/systemd/system/multi-user.target.wants/systemd-networkd.service" 2>/dev/null || true
+  ln -sf /lib/systemd/system/systemd-networkd.socket \
+    "${mnt}/etc/systemd/system/sockets.target.wants/systemd-networkd.socket" 2>/dev/null || true
+
+  umount "$mnt"
+  rmdir "$mnt"
+}
+
+# --- firecracker config -----------------------------------------------
+
+write_vm_config() {
+  local name="$1" vm_id="$2" vcpus="$3" mem="$4"
+  local mac; mac=$(mac_addr "$vm_id")
+  local tap; tap=$(tap_name "$vm_id")
+  local dir="${VM_DIR}/${name}"
+
+  cat > "${dir}/vm_config.json" <<EOF
+{
+  "boot-source": {
+    "kernel_image_path": "${KERNEL}",
+    "boot_args": "${BOOT_ARGS}"
+  },
+  "drives": [
+    {
+      "drive_id": "rootfs",
+      "path_on_host": "${dir}/rootfs.ext4",
+      "is_root_device": true,
+      "is_read_only": false
+    }
+  ],
+  "network-interfaces": [
+    {
+      "iface_id": "eth0",
+      "guest_mac": "${mac}",
+      "host_dev_name": "${tap}"
+    }
+  ],
+  "machine-config": {
+    "vcpu_count": ${vcpus},
+    "mem_size_mib": ${mem}
+  }
+}
+EOF
+}
+
+# =====================================================================
+#  COMMANDS
+# =====================================================================
+
+# --- create -----------------------------------------------------------
+
+cmd_create() {
+  local name="${1:?usage: fcctl create <name> [vcpus] [mem_mib] [disk_mib]}"
+  local vcpus="${2:-$DEFAULT_VCPUS}"
+  local mem="${3:-$DEFAULT_MEM}"
+  local disk="${4:-$DEFAULT_DISK}"
+  local vm_id; vm_id=$(derive_vm_id "$name")
+  local dir="${VM_DIR}/${name}"
+
+  vm_exists "$name" && die "vm '${name}' already exists"
+  is_int "$vcpus" || die "vcpus must be an integer"
+  is_int "$mem"   || die "mem must be an integer (MiB)"
+  is_int "$disk"  || die "disk must be an integer (MiB)"
+
+  [ -f "$KERNEL" ]      || die "kernel not found at ${KERNEL}"
+  [ -f "$BASE_ROOTFS" ] || die "base rootfs not found at ${BASE_ROOTFS}"
+
+  # check for vm_id collision
+  for d in "${VM_DIR}"/*/; do
+    [ -d "$d" ] || continue
+    local existing; existing=$(basename "$d")
+    [ -f "${d}/metadata" ] || continue
+    local eid; eid=$(get_meta "$existing" "vm_id")
+    if [ "$eid" = "$vm_id" ]; then
+      die "vm_id collision: '${name}' hashes to id ${vm_id}, same as '${existing}'"
+    fi
+  done
+
+  log "checking resource budget"
+  check_budget "$vcpus" "$mem" "$disk" ""
+
+  log "creating vm '${name}' (id=${vm_id}, vcpus=${vcpus}, mem=${mem}M, disk=${disk}M)"
+  mkdir -p "$dir"
+
+  # create rootfs at requested size (use apparent size, not allocated blocks — base is sparse)
+  local base_size_mib; base_size_mib=$(file_size_mib "$BASE_ROOTFS")
+  if [ "$disk" -lt "$base_size_mib" ]; then
+    warn "requested disk (${disk}M) < base image (${base_size_mib}M), using base size"
+    disk=$base_size_mib
+  fi
+
+  log "copying rootfs ($(du -sh "$BASE_ROOTFS" | cut -f1))..."
+  cp "$BASE_ROOTFS" "${dir}/rootfs.ext4"
+
+  # grow rootfs if requested disk > base
+  if [ "$disk" -gt "$base_size_mib" ]; then
+    log "resizing rootfs to ${disk}M"
+    truncate -s "${disk}M" "${dir}/rootfs.ext4"
+    e2fsck -fy "${dir}/rootfs.ext4" &>/dev/null
+    resize2fs "${dir}/rootfs.ext4" &>/dev/null
+  fi
+
+  log "configuring guest filesystem"
+  configure_rootfs "$name" "$vm_id"
+
+  write_vm_config "$name" "$vm_id" "$vcpus" "$mem"
+
+  cat > "${dir}/metadata" <<EOF
+name=${name}
+vm_id=${vm_id}
+vcpus=${vcpus}
+mem=${mem}
+disk=${disk}
+host_ip=$(host_ip "$vm_id")
+guest_ip=$(guest_ip "$vm_id")
+tap=$(tap_name "$vm_id")
+proxy_port=$(proxy_port "$vm_id")
+mac=$(mac_addr "$vm_id")
+created=$(date -Iseconds)
+EOF
+
+  ok "vm '${name}' created"
+  printf "  ${DIM}guest ip:   $(guest_ip "$vm_id")${RESET}\n"
+  printf "  ${DIM}host tap:   $(tap_name "$vm_id") ($(host_ip "$vm_id"))${RESET}\n"
+  printf "  ${DIM}proxy:      $(host_ip "$vm_id"):$(proxy_port "$vm_id")${RESET}\n"
+  printf "  ${DIM}resources:  ${vcpus} vcpu, ${mem}M ram, ${disk}M disk${RESET}\n"
+}
+
+# --- start ------------------------------------------------------------
+
+cmd_start() {
+  local name="${1:?usage: fcctl start <name>}"
+  vm_exists "$name" || die "vm '${name}' does not exist"
+
+  if is_running "$name"; then
+    warn "vm '${name}' is already running"
+    return 0
+  fi
+
+  local vm_id; vm_id=$(get_meta "$name" "vm_id")
+  local gip;   gip=$(get_meta "$name" "guest_ip")
+  local vcpus; vcpus=$(get_meta "$name" "vcpus")
+  local mem;   mem=$(get_meta "$name" "mem")
+  local disk;  disk=$(get_meta "$name" "disk")
+  local dir="${VM_DIR}/${name}"
+
+  # re-validate budget at start time (state may have changed since create)
+  [ -z "$vcpus" ] && vcpus=$DEFAULT_VCPUS
+  [ -z "$mem" ]   && mem=$DEFAULT_MEM
+  [ -z "$disk" ]  && disk=$DEFAULT_DISK
+
+  log "checking resource budget"
+  check_budget "$vcpus" "$mem" "$disk" "$name"
+
+  ensure_kvm
+
+  log "starting vm '${name}' (id=${vm_id})"
+
+  create_tap "$vm_id"
+  start_dnsmasq "$vm_id"
+  start_tinyproxy "$vm_id"
+
+  rm -f "${dir}/firecracker.socket"
+
+  log "launching firecracker"
+  firecracker \
+    --api-sock "${dir}/firecracker.socket" \
+    --config-file "${dir}/vm_config.json" \
+    --log-path "${dir}/console.log" \
+    --level Info \
+    --show-level \
+    --show-log-origin \
+    >> "${dir}/console.log" 2>&1 &
+
+  local fc_pid=$!
+  echo "$fc_pid" > "${dir}/pid"
+
+  log "waiting for guest (timeout: ${PING_TIMEOUT}s)"
+  local elapsed=0
+  while [ $elapsed -lt $PING_TIMEOUT ]; do
+    if ! kill -0 "$fc_pid" 2>/dev/null; then
+      rm -f "${dir}/pid"
+      die "firecracker exited prematurely — check ${dir}/console.log"
+    fi
+    if ping -c1 -W1 "$gip" &>/dev/null; then
+      ok "vm '${name}' is running (${gip}, boot: ${elapsed}s)"
+      return 0
+    fi
+    sleep 1
+    elapsed=$((elapsed + 1))
+  done
+
+  warn "vm started but guest not responding to ping after ${PING_TIMEOUT}s"
+  warn "firecracker pid: ${fc_pid} — check ${dir}/console.log"
+}
+
+# --- stop -------------------------------------------------------------
+
+cmd_stop() {
+  local name="${1:?usage: fcctl stop <name>}"
+  vm_exists "$name" || die "vm '${name}' does not exist"
+
+  if ! is_running "$name"; then
+    warn "vm '${name}' is not running"
+    return 0
+  fi
+
+  local vm_id; vm_id=$(get_meta "$name" "vm_id")
+  local dir="${VM_DIR}/${name}"
+  local pid; pid=$(cat "${dir}/pid")
+
+  log "stopping vm '${name}' (pid=${pid})"
+
+  if [ -S "${dir}/firecracker.socket" ]; then
+    curl -s --unix-socket "${dir}/firecracker.socket" \
+      -X PUT "http://localhost/actions" \
+      -H "Content-Type: application/json" \
+      -d '{"action_type":"SendCtrlAltDel"}' &>/dev/null || true
+    sleep 1
+  fi
+
+  if kill -0 "$pid" 2>/dev/null; then
+    kill "$pid" 2>/dev/null || true
+    sleep 1
+  fi
+
+  if kill -0 "$pid" 2>/dev/null; then
+    kill -9 "$pid" 2>/dev/null || true
+  fi
+
+  rm -f "${dir}/pid" "${dir}/firecracker.socket"
+
+  stop_dnsmasq "$vm_id"
+  stop_tinyproxy "$vm_id"
+
+  ok "vm '${name}' stopped"
+}
+
+# --- ssh --------------------------------------------------------------
+
+cmd_ssh() {
+  local name="${1:?usage: fcctl ssh <name> [command...]}"
+  shift
+  vm_exists "$name" || die "vm '${name}' does not exist"
+  is_running "$name" || die "vm '${name}' is not running"
+
+  local gip; gip=$(get_meta "$name" "guest_ip")
+
+  exec sshpass -p root ssh \
+    -o StrictHostKeyChecking=no \
+    -o UserKnownHostsFile=/dev/null \
+    -o LogLevel=ERROR \
+    -o ConnectTimeout=5 \
+    "root@${gip}" "$@"
+}
+
+# --- resize -----------------------------------------------------------
+
+cmd_resize() {
+  local name=""
+  local new_cpus="" new_mem="" new_disk=""
+
+  # parse args: fcctl resize <name> [--cpus N] [--mem N] [--disk N]
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --cpus)  shift; new_cpus="${1:?--cpus requires a value}" ;;
+      --mem)   shift; new_mem="${1:?--mem requires a value}" ;;
+      --disk)  shift; new_disk="${1:?--disk requires a value}" ;;
+      -*)      die "unknown flag: $1" ;;
+      *)       [ -z "$name" ] && name="$1" || die "unexpected arg: $1" ;;
+    esac
+    shift
+  done
+
+  [ -z "$name" ] && die "usage: fcctl resize <name> [--cpus N] [--mem N] [--disk N]"
+  vm_exists "$name" || die "vm '${name}' does not exist"
+  is_running "$name" && die "vm '${name}' is running — stop it first (fire stop ${name})"
+
+  # if nothing requested, show current and bail
+  if [ -z "$new_cpus" ] && [ -z "$new_mem" ] && [ -z "$new_disk" ]; then
+    local c; c=$(get_meta "$name" "vcpus")
+    local m; m=$(get_meta "$name" "mem")
+    local d; d=$(get_meta "$name" "disk")
+    [ -z "$d" ] && d=$(vm_disk_mib "$name")
+    printf "${BOLD}%s${RESET} — current allocation: ${BOLD}%s${RESET} vcpu, ${BOLD}%s${RESET}M ram, ${BOLD}%s${RESET}M disk\n" \
+      "$name" "$c" "$m" "$d"
+    printf "  ${DIM}use --cpus, --mem, --disk to change${RESET}\n"
+    return 0
+  fi
+
+  local vm_id; vm_id=$(get_meta "$name" "vm_id")
+  local cur_cpus; cur_cpus=$(get_meta "$name" "vcpus")
+  local cur_mem;  cur_mem=$(get_meta "$name" "mem")
+  local cur_disk; cur_disk=$(get_meta "$name" "disk")
+  [ -z "$cur_disk" ] && cur_disk=$(vm_disk_mib "$name")
+
+  # fill in unchanged values
+  [ -z "$new_cpus" ] && new_cpus="$cur_cpus"
+  [ -z "$new_mem" ]  && new_mem="$cur_mem"
+  [ -z "$new_disk" ] && new_disk="$cur_disk"
+
+  is_int "$new_cpus" || die "cpus must be an integer"
+  is_int "$new_mem"  || die "mem must be an integer (MiB)"
+  is_int "$new_disk" || die "disk must be an integer (MiB)"
+
+  # disk can only grow
+  if [ "$new_disk" -lt "$cur_disk" ]; then
+    die "disk shrink not supported (current: ${cur_disk}M, requested: ${new_disk}M) — only growth is safe"
+  fi
+
+  # validate budget, excluding this VM's current allocation
+  log "checking resource budget"
+  check_budget "$new_cpus" "$new_mem" "$new_disk" "$name"
+
+  # show diff
+  local changed=false
+  if [ "$new_cpus" != "$cur_cpus" ]; then
+    log "vcpus: ${cur_cpus} → ${new_cpus}"
+    changed=true
+  fi
+  if [ "$new_mem" != "$cur_mem" ]; then
+    log "memory: ${cur_mem}M → ${new_mem}M"
+    changed=true
+  fi
+  if [ "$new_disk" != "$cur_disk" ]; then
+    log "disk: ${cur_disk}M → ${new_disk}M"
+    changed=true
+  fi
+
+  if [ "$changed" = false ]; then
+    ok "nothing to change"
+    return 0
+  fi
+
+  # apply cpu + mem changes to config
+  write_vm_config "$name" "$vm_id" "$new_cpus" "$new_mem"
+  set_meta "$name" "vcpus" "$new_cpus"
+  set_meta "$name" "mem" "$new_mem"
+
+  # apply disk growth
+  if [ "$new_disk" -gt "$cur_disk" ]; then
+    local rootfs="${VM_DIR}/${name}/rootfs.ext4"
+    log "growing rootfs ${cur_disk}M → ${new_disk}M"
+    truncate -s "${new_disk}M" "$rootfs"
+    e2fsck -fy "$rootfs" &>/dev/null
+    resize2fs "$rootfs" &>/dev/null
+    set_meta "$name" "disk" "$new_disk"
+  fi
+
+  ok "vm '${name}' resized: ${new_cpus} vcpu, ${new_mem}M ram, ${new_disk}M disk"
+}
+
+# --- destroy ----------------------------------------------------------
+
+cmd_destroy() {
+  local name="${1:?usage: fcctl destroy <name>}"
+  vm_exists "$name" || die "vm '${name}' does not exist"
+
+  local vm_id; vm_id=$(get_meta "$name" "vm_id")
+
+  if is_running "$name"; then
+    cmd_stop "$name"
+  fi
+
+  log "destroying vm '${name}'"
+
+  destroy_tap "$vm_id"
+  stop_dnsmasq "$vm_id"
+  stop_tinyproxy "$vm_id"
+
+  rm -rf "${VM_DIR:?}/${name}"
+
+  ok "vm '${name}' destroyed"
+}
+
+# --- status -----------------------------------------------------------
+
+cmd_status() {
+  local name="${1:-}"
+
+  if [ -n "$name" ]; then
+    vm_exists "$name" || die "vm '${name}' does not exist"
+
+    local vm_id; vm_id=$(get_meta "$name" "vm_id")
+    local gip;   gip=$(get_meta "$name" "guest_ip")
+    local hip;   hip=$(get_meta "$name" "host_ip")
+    local vcpus; vcpus=$(get_meta "$name" "vcpus")
+    local mem;   mem=$(get_meta "$name" "mem")
+    local disk;  disk=$(get_meta "$name" "disk")
+    local tap;   tap=$(get_meta "$name" "tap")
+    local port;  port=$(get_meta "$name" "proxy_port")
+
+    [ -z "$disk" ] && disk=$(vm_disk_mib "$name")
+
+    local state
+    if is_running "$name"; then
+      state="${GREEN}running${RESET}"
+    else
+      state="${DIM}stopped${RESET}"
+    fi
+
+    printf "${BOLD}%s${RESET}\n" "$name"
+    printf "  state:      %s\n" "$state"
+    printf "  vm_id:      %s\n" "$vm_id"
+    printf "  guest_ip:   %s\n" "$gip"
+    printf "  host_ip:    %s\n" "$hip"
+    printf "  tap:        %s\n" "$tap"
+    printf "  vcpus:      %s\n" "$vcpus"
+    printf "  memory:     %s MiB\n" "$mem"
+    printf "  disk:       %s MiB\n" "$disk"
+    printf "  proxy:      %s:%s\n" "$hip" "$port"
+
+    if is_running "$name"; then
+      printf "  pid:        %s\n" "$(cat "${VM_DIR}/${name}/pid")"
+    fi
+    return 0
+  fi
+
+  cmd_list
+}
+
+# --- list -------------------------------------------------------------
+
+cmd_list() {
+  local has_vms=false
+
+  printf "${BOLD}%-16s %-10s %-6s %-8s %-8s %-18s %s${RESET}\n" \
+    "NAME" "STATE" "VCPUS" "MEM" "DISK" "IP" "ID"
+
+  for dir in "${VM_DIR}"/*/; do
+    [ -d "$dir" ] || continue
+    local name; name=$(basename "$dir")
+    [ -f "${dir}/metadata" ] || continue
+
+    has_vms=true
+    local vm_id; vm_id=$(get_meta "$name" "vm_id")
+    local gip;   gip=$(get_meta "$name" "guest_ip")
+    local vcpus; vcpus=$(get_meta "$name" "vcpus")
+    local mem;   mem=$(get_meta "$name" "mem")
+    local disk;  disk=$(get_meta "$name" "disk")
+
+    [ -z "$disk" ] && disk=$(vm_disk_mib "$name")
+
+    local state
+    if is_running "$name"; then
+      state="${GREEN}running${RESET}"
+    else
+      state="${DIM}stopped${RESET}"
+    fi
+
+    printf "%-16s %s  %-6s %-8s %-8s %-18s %s\n" \
+      "$name" "$state" "$vcpus" "${mem}M" "${disk}M" "$gip" "$vm_id"
+  done
+
+  if [ "$has_vms" = false ]; then
+    printf "  ${DIM}no vms found${RESET}\n"
+  fi
+}
+
+# --- logs -------------------------------------------------------------
+
+cmd_logs() {
+  local name="${1:?usage: fcctl logs <name>}"
+  vm_exists "$name" || die "vm '${name}' does not exist"
+
+  local logfile="${VM_DIR}/${name}/console.log"
+  [ -f "$logfile" ] || die "no log file for '${name}'"
+
+  if [ "${2:-}" = "-f" ]; then
+    tail -f "$logfile"
+  else
+    cat "$logfile"
+  fi
+}
+
+# --- resources --------------------------------------------------------
+
+cmd_resources() {
+  local lima_cpus; lima_cpus=$(lima_total_cpus)
+  local lima_mem;  lima_mem=$(lima_total_mem_mib)
+  local lima_disk; lima_disk=$(lima_total_disk_mib)
+  local lima_free; lima_free=$(lima_free_disk_mib)
+
+  local alloc_cpus; alloc_cpus=$(sum_allocated "vcpus" "")
+  local alloc_mem;  alloc_mem=$(sum_allocated "mem" "")
+  local alloc_disk; alloc_disk=$(sum_allocated_disk_mib "")
+
+  local mem_ceiling=$(( lima_mem - LIMA_OS_RESERVE_MIB ))
+  [ "$mem_ceiling" -lt 0 ] && mem_ceiling=0
+  local mem_avail=$(( mem_ceiling - alloc_mem ))
+  [ "$mem_avail" -lt 0 ] && mem_avail=0
+
+  # count VMs
+  local vm_count=0 vm_running=0
+  for d in "${VM_DIR}"/*/; do
+    [ -d "$d" ] || continue
+    [ -f "${d}/metadata" ] || continue
+    vm_count=$((vm_count + 1))
+    local n; n=$(basename "$d")
+    is_running "$n" && vm_running=$((vm_running + 1))
+  done
+
+  printf "\n"
+  printf "${BOLD}  LIMA VM${RESET}${DIM} (host for all microVMs)${RESET}\n"
+  printf "  ─────────────────────────────────────────────────────\n"
+
+  # cpu bar
+  local cpu_pct=0
+  [ "$lima_cpus" -gt 0 ] && cpu_pct=$(( alloc_cpus * 100 / lima_cpus ))
+  printf "  cpus:    %s / %s" "$alloc_cpus" "$lima_cpus"
+  if [ "$alloc_cpus" -gt "$lima_cpus" ]; then
+    printf "  ${YELLOW}(overcommit)${RESET}"
+  fi
+  printf "\n"
+  _bar "$cpu_pct"
+
+  # mem bar
+  local mem_pct=0
+  [ "$mem_ceiling" -gt 0 ] && mem_pct=$(( alloc_mem * 100 / mem_ceiling ))
+  printf "  memory:  %sM / %sM allocatable" "$alloc_mem" "$mem_ceiling"
+  printf "${DIM}  (%sM total, %sM reserved for OS)${RESET}\n" "$lima_mem" "$LIMA_OS_RESERVE_MIB"
+  _bar "$mem_pct"
+
+  # disk bar
+  local disk_total_usable=$(( lima_disk - LIMA_DISK_RESERVE_MIB ))
+  [ "$disk_total_usable" -lt 0 ] && disk_total_usable=0
+  local disk_pct=0
+  [ "$disk_total_usable" -gt 0 ] && disk_pct=$(( alloc_disk * 100 / disk_total_usable ))
+  printf "  disk:    %sM / %sM free" "$alloc_disk" "$lima_free"
+  printf "${DIM}  (%sM total, %sM reserved for system)${RESET}\n" "$lima_disk" "$LIMA_DISK_RESERVE_MIB"
+  _bar "$disk_pct"
+
+  printf "\n"
+  printf "${BOLD}  MICROVMS${RESET}${DIM} (%d total, %d running)${RESET}\n" "$vm_count" "$vm_running"
+  printf "  ─────────────────────────────────────────────────────\n"
+
+  if [ "$vm_count" -eq 0 ]; then
+    printf "  ${DIM}none${RESET}\n\n"
+    return 0
+  fi
+
+  printf "  ${DIM}%-14s %-9s %6s %8s %8s${RESET}\n" "NAME" "STATE" "VCPUS" "MEM" "DISK"
+  for d in "${VM_DIR}"/*/; do
+    [ -d "$d" ] || continue
+    local name; name=$(basename "$d")
+    [ -f "${d}/metadata" ] || continue
+
+    local vcpus; vcpus=$(get_meta "$name" "vcpus")
+    local mem;   mem=$(get_meta "$name" "mem")
+    local disk;  disk=$(get_meta "$name" "disk")
+    [ -z "$disk" ] && disk=$(vm_disk_mib "$name")
+
+    local state_str
+    if is_running "$name"; then
+      state_str="${GREEN}running${RESET}"
+    else
+      state_str="${DIM}stopped${RESET}"
+    fi
+
+    printf "  %-14s %s  %4s   %5sM   %5sM\n" "$name" "$state_str" "$vcpus" "$mem" "$disk"
+  done
+
+  printf "  ${DIM}──────────────────────────────────────────────${RESET}\n"
+  printf "  ${BOLD}%-14s %9s %6s %8s %8s${RESET}\n" "TOTAL" "" "$alloc_cpus" "${alloc_mem}M" "${alloc_disk}M"
+  printf "  ${GREEN}%-14s %9s %6s %8s %8s${RESET}\n" "AVAILABLE" "" \
+    "$((lima_cpus - alloc_cpus > 0 ? lima_cpus - alloc_cpus : 0))" \
+    "${mem_avail}M" "${lima_free}M"
+  printf "\n"
+}
+
+_bar() {
+  local pct="$1"
+  [ "$pct" -gt 100 ] && pct=100
+  local width=40
+  local filled=$(( pct * width / 100 ))
+  local empty=$(( width - filled ))
+  local color="$GREEN"
+  [ "$pct" -ge 70 ] && color="$YELLOW"
+  [ "$pct" -ge 90 ] && color="$RED"
+
+  printf "  ${DIM}[${RESET}"
+  printf "${color}"
+  local i
+  for ((i=0; i<filled; i++)); do printf "█"; done
+  printf "${RESET}${DIM}"
+  for ((i=0; i<empty; i++)); do printf "░"; done
+  printf "${RESET}${DIM}]${RESET} %d%%\n" "$pct"
+}
+
+# --- main -------------------------------------------------------------
+
+usage() {
+  cat <<EOF
+${BOLD}fcctl${RESET} — firecracker microVM manager
+
+${BOLD}usage:${RESET}
+  fcctl create    <name> [vcpus] [mem] [disk]   create a VM (default: ${DEFAULT_VCPUS} cpu, ${DEFAULT_MEM}M, ${DEFAULT_DISK}M disk)
+  fcctl start     <name>                         start a VM
+  fcctl stop      <name>                         stop a VM
+  fcctl ssh       <name> [cmd...]                ssh into a VM
+  fcctl resize    <name> [--cpus N] [--mem N] [--disk N]
+  fcctl status    [name]                         show VM status
+  fcctl list                                     list all VMs
+  fcctl resources                                show resource budget
+  fcctl logs      <name> [-f]                    view VM console log
+  fcctl destroy   <name>                         stop and delete a VM
+EOF
+}
+
+main() {
+  local cmd="${1:-help}"
+  shift 2>/dev/null || true
+
+  case "$cmd" in
+    create)    cmd_create "$@" ;;
+    start)     cmd_start "$@" ;;
+    stop)      cmd_stop "$@" ;;
+    ssh)       cmd_ssh "$@" ;;
+    resize)    cmd_resize "$@" ;;
+    status)    cmd_status "$@" ;;
+    list|ls)   cmd_list ;;
+    resources) cmd_resources ;;
+    logs)      cmd_logs "$@" ;;
+    destroy)   cmd_destroy "$@" ;;
+    _sum_mem)  sum_allocated "mem" "" ;;
+    _sum_cpus) sum_allocated "vcpus" "" ;;
+    help|-h|--help) usage ;;
+    *) err "unknown command: ${cmd}"; usage; exit 1 ;;
+  esac
+}
+
+main "$@"

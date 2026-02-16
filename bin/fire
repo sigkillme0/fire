@@ -1,0 +1,682 @@
+#!/usr/bin/env bash
+#
+# fire — macOS host-side wrapper for firecracker-on-lima
+# proxies commands through lima to fcctl inside the VM
+#
+set -euo pipefail
+
+readonly LIMA_VM="${FIRE_LIMA_VM:-mvm}"
+SELF="$0"
+while [ -L "$SELF" ]; do
+  SELF_DIR="$(cd "$(dirname "$SELF")" && pwd)"
+  SELF="$(readlink "$SELF")"
+  [[ "$SELF" != /* ]] && SELF="$SELF_DIR/$SELF"
+done
+readonly SCRIPT_DIR="$(cd "$(dirname "$SELF")" && pwd)"
+readonly REPO_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+readonly LIMA_TEMPLATE="${REPO_DIR}/lima/firecracker.yaml"
+readonly FCCTL_SRC="${REPO_DIR}/lib/fcctl"
+
+# --- safety constants -------------------------------------------------
+# these match fcctl's constants. single source of truth is fcctl;
+# we duplicate here for host-side pre-flight checks.
+
+readonly HOST_RESERVE_MIB=8192        # 8G — keep macOS responsive
+readonly LIMA_OS_RESERVE_MIB=1024     # 1G — lima kernel + systfemd + services
+readonly LIMA_DISK_RESERVE_MIB=5120   # 5G — kernel + base rootfs + apt
+readonly MIN_LIMA_CPUS=2
+readonly MIN_LIMA_MEM_MIB=2048
+readonly MIN_LIMA_DISK_MIB=20480
+
+# --- colors -----------------------------------------------------------
+
+readonly RED=$'\033[0;31m'
+readonly GREEN=$'\033[0;32m'
+readonly YELLOW=$'\033[0;33m'
+readonly CYAN=$'\033[0;36m'
+readonly BOLD=$'\033[1m'
+readonly DIM=$'\033[2m'
+readonly RESET=$'\033[0m'
+
+log()  { printf "${CYAN}▸${RESET} %s\n" "$*"; }
+ok()   { printf "${GREEN}✓${RESET} %s\n" "$*"; }
+warn() { printf "${YELLOW}⚠${RESET} %s\n" "$*" >&2; }
+err()  { printf "${RED}✗${RESET} %s\n" "$*" >&2; }
+die()  { err "$*"; exit 1; }
+
+is_int() { [[ "$1" =~ ^[0-9]+$ ]]; }
+
+# --- host queries -----------------------------------------------------
+
+host_cpus()       { sysctl -n hw.ncpu; }
+host_mem_mib()    { echo $(( $(sysctl -n hw.memsize) / 1048576 )); }
+host_disk_free_mib() { df -m / | awk 'NR==2{print $4}'; }
+host_chip()       { sysctl -n machdep.cpu.brand_string 2>/dev/null || echo "unknown"; }
+
+# --- dependency checks ------------------------------------------------
+
+require_brew() {
+  command -v brew &>/dev/null && return 0
+  die "homebrew is required — install it from https://brew.sh"
+}
+
+require_bin() {
+  local bin="$1" pkg="${2:-$1}"
+  command -v "$bin" &>/dev/null && return 0
+
+  log "${bin} not found — installing via homebrew"
+  require_brew
+  brew install "$pkg" || die "failed to install ${pkg}"
+  command -v "$bin" &>/dev/null || die "${bin} still not found after installing ${pkg}"
+  ok "${pkg} installed"
+}
+
+require_lima() {
+  require_bin limactl lima
+}
+
+require_jq() {
+  require_bin jq jq
+}
+
+require_chip() {
+  [[ "$(uname -m)" == "arm64" ]] || die "firecracker-macos requires apple silicon (arm64)"
+
+  local chip; chip=$(host_chip)
+  # nested virtualization requires M3 or later.
+  # M1/M2 chips report "Apple M1" / "Apple M2" etc.
+  if [[ "$chip" =~ Apple\ M[12][^0-9] ]] || [[ "$chip" =~ Apple\ M[12]$ ]]; then
+    err "nested virtualization requires Apple M3 or later"
+    err "detected: ${chip}"
+    err "M1/M2 chips do not support nested virtualization in Virtualization.framework"
+    die "incompatible hardware"
+  fi
+}
+
+require_deps() {
+  require_chip
+  require_lima
+  require_jq
+}
+
+vm_exists() { limactl list -q 2>/dev/null | grep -qx "$LIMA_VM"; }
+
+vm_running() {
+  limactl list --json 2>/dev/null \
+    | jq -re --arg name "$LIMA_VM" \
+      'select(.name == $name) | .status == "Running"' &>/dev/null
+}
+
+ensure_vm() {
+  vm_exists || die "lima VM '${LIMA_VM}' does not exist — run: fire setup"
+  vm_running || die "lima VM '${LIMA_VM}' is not running — run: fire vm start"
+}
+
+lima_json() { limactl list --json 2>/dev/null | jq -r "select(.name == \"$LIMA_VM\")"; }
+lima_cpus() { lima_json | jq -r '.cpus'; }
+lima_mem_bytes() { lima_json | jq -r '.memory'; }
+lima_mem_mib() { echo $(( $(lima_mem_bytes) / 1048576 )); }
+lima_disk_bytes() { lima_json | jq -r '.disk'; }
+lima_disk_mib() { echo $(( $(lima_disk_bytes) / 1048576 )); }
+
+lima_yaml_path() { echo "${HOME}/.lima/${LIMA_VM}/lima.yaml"; }
+
+# --- sync fcctl into the VM ------------------------------------------
+
+sync_fcctl() {
+  [ -f "$FCCTL_SRC" ] || die "fcctl not found at ${FCCTL_SRC}"
+
+  local remote_hash local_hash
+  remote_hash=$(limactl shell "$LIMA_VM" -- md5sum /usr/local/bin/fcctl 2>/dev/null | awk '{print $1}') || remote_hash=""
+  local_hash=$(md5 -q "$FCCTL_SRC" 2>/dev/null || md5sum "$FCCTL_SRC" | awk '{print $1}')
+
+  if [[ "$remote_hash" != "$local_hash" ]]; then
+    log "syncing fcctl into VM"
+    limactl cp "$FCCTL_SRC" "${LIMA_VM}:/tmp/fcctl.tmp"
+    limactl shell "$LIMA_VM" -- sudo mv /tmp/fcctl.tmp /usr/local/bin/fcctl
+    limactl shell "$LIMA_VM" -- sudo chmod +x /usr/local/bin/fcctl
+    ok "fcctl synced"
+  fi
+}
+
+# --- run fcctl inside the VM -----------------------------------------
+
+run_fcctl() {
+  ensure_vm
+  sync_fcctl
+  limactl shell "$LIMA_VM" -- sudo /usr/local/bin/fcctl "$@"
+}
+
+# --- bar drawing ------------------------------------------------------
+
+draw_bar() {
+  local pct="$1" label="${2:-}"
+  [ "$pct" -gt 100 ] && pct=100
+  local width=40
+  local filled=$(( pct * width / 100 ))
+  local empty=$(( width - filled ))
+  local color="$GREEN"
+  [ "$pct" -ge 70 ] && color="$YELLOW"
+  [ "$pct" -ge 90 ] && color="$RED"
+
+  printf "           ${DIM}[${RESET}${color}"
+  local i
+  for ((i=0; i<filled; i++)); do printf "█"; done
+  printf "${RESET}${DIM}"
+  for ((i=0; i<empty; i++)); do printf "░"; done
+  printf "]${RESET} %d%%" "$pct"
+  [ -n "$label" ] && printf "  ${DIM}%s${RESET}" "$label"
+  printf "\n"
+}
+
+mib_to_human() {
+  local mib="$1"
+  if [ "$mib" -ge 1024 ]; then
+    printf "%.1fG" "$(echo "$mib / 1024" | bc -l)"
+  else
+    printf "%dM" "$mib"
+  fi
+}
+
+# =====================================================================
+#  COMMANDS
+# =====================================================================
+
+# --- setup ------------------------------------------------------------
+
+cmd_setup() {
+  require_deps
+
+  [ -f "$LIMA_TEMPLATE" ] || die "lima template not found at ${LIMA_TEMPLATE}"
+
+  if vm_exists; then
+    if vm_running; then
+      ok "VM '${LIMA_VM}' already exists and is running"
+    else
+      log "VM '${LIMA_VM}' exists but is stopped — starting"
+      limactl start "$LIMA_VM"
+      ok "VM started"
+    fi
+  else
+    log "creating lima VM '${LIMA_VM}' (this takes a few minutes on first run)"
+    log "it will download ubuntu, firecracker, kernel, and rootfs"
+    printf "\n"
+    limactl create --name "$LIMA_VM" "$LIMA_TEMPLATE" --tty=false
+    limactl start "$LIMA_VM"
+    ok "VM '${LIMA_VM}' created and started"
+  fi
+
+  limactl shell "$LIMA_VM" -- sudo chmod 666 /dev/kvm 2>/dev/null || true
+  sync_fcctl
+  limactl shell "$LIMA_VM" -- sudo mkdir -p /srv/firecracker
+
+  # offer to add fire to PATH if not already there
+  if ! command -v fire &>/dev/null; then
+    local link_dir=""
+    if [ -d /opt/homebrew/bin ] && [ -w /opt/homebrew/bin ]; then
+      link_dir="/opt/homebrew/bin"
+    elif [ -d /usr/local/bin ] && [ -w /usr/local/bin ]; then
+      link_dir="/usr/local/bin"
+    fi
+
+    if [ -n "$link_dir" ]; then
+      ln -sf "${REPO_DIR}/bin/fire" "${link_dir}/fire"
+      ok "fire linked to ${link_dir}/fire"
+    else
+      warn "could not find a writable bin directory on your PATH"
+      printf "  ${DIM}add this to your shell profile:${RESET}\n"
+      printf "    export PATH=\"${REPO_DIR}/bin:\$PATH\"\n"
+    fi
+  fi
+
+  printf "\n"
+  ok "setup complete"
+  printf "\n"
+  printf "  ${BOLD}quickstart:${RESET}\n"
+  printf "    fire create myvm        ${DIM}# create a microVM${RESET}\n"
+  printf "    fire start myvm         ${DIM}# boot it (~6s)${RESET}\n"
+  printf "    fire ssh myvm           ${DIM}# shell in${RESET}\n"
+  printf "    fire stop myvm          ${DIM}# shut it down${RESET}\n"
+  printf "    fire destroy myvm       ${DIM}# delete it${RESET}\n"
+  printf "\n"
+}
+
+# --- resources --------------------------------------------------------
+# the crown jewel. 3-layer resource dashboard.
+
+cmd_resources() {
+  require_lima
+  require_jq
+
+  # --- layer 1: host ---
+  local h_cpus; h_cpus=$(host_cpus)
+  local h_mem;  h_mem=$(host_mem_mib)
+  local h_disk; h_disk=$(host_disk_free_mib)
+  local h_chip; h_chip=$(host_chip)
+
+  printf "\n"
+  printf "  ${BOLD}HOST${RESET}  ${DIM}%s — macOS %s${RESET}\n" "$h_chip" "$(sw_vers -productVersion 2>/dev/null)"
+  printf "  ─────────────────────────────────────────────────────────\n"
+  printf "  cpus:    ${BOLD}%s${RESET} physical cores\n" "$h_cpus"
+  printf "  memory:  ${BOLD}%s${RESET} total" "$(mib_to_human "$h_mem")"
+  printf "  ${DIM}(%s reserved for macOS)${RESET}\n" "$(mib_to_human $HOST_RESERVE_MIB)"
+  printf "  disk:    ${BOLD}%s${RESET} free\n" "$(mib_to_human "$h_disk")"
+
+  if ! vm_exists; then
+    printf "\n  ${DIM}lima VM not created — run: fire setup${RESET}\n\n"
+    return 0
+  fi
+
+  # --- layer 2: lima ---
+  local l_cpus; l_cpus=$(lima_cpus)
+  local l_mem;  l_mem=$(lima_mem_mib)
+  local l_disk; l_disk=$(lima_disk_mib)
+  local l_status="stopped"
+  vm_running && l_status="running"
+
+  local l_cpu_pct=$(( l_cpus * 100 / h_cpus ))
+  local l_mem_allocatable=$(( h_mem - HOST_RESERVE_MIB ))
+  [ "$l_mem_allocatable" -lt 0 ] && l_mem_allocatable=0
+  local l_mem_pct=0
+  [ "$l_mem_allocatable" -gt 0 ] && l_mem_pct=$(( l_mem * 100 / l_mem_allocatable ))
+
+  printf "\n"
+  if [ "$l_status" = "running" ]; then
+    printf "  ${BOLD}LIMA VM${RESET}  ${DIM}%s${RESET}  ${GREEN}●${RESET} running\n" "$LIMA_VM"
+  else
+    printf "  ${BOLD}LIMA VM${RESET}  ${DIM}%s${RESET}  ${DIM}○ stopped${RESET}\n" "$LIMA_VM"
+  fi
+  printf "  ─────────────────────────────────────────────────────────\n"
+
+  printf "  cpus:    ${BOLD}%s${RESET} / %s host cores\n" "$l_cpus" "$h_cpus"
+  draw_bar "$l_cpu_pct"
+
+  printf "  memory:  ${BOLD}%s${RESET} / %s allocatable" "$(mib_to_human "$l_mem")" "$(mib_to_human "$l_mem_allocatable")"
+  printf "  ${DIM}(%s host total)${RESET}\n" "$(mib_to_human "$h_mem")"
+  draw_bar "$l_mem_pct"
+
+  local l_disk_pct=0
+  [ "$h_disk" -gt 0 ] && l_disk_pct=$(( l_disk * 100 / h_disk ))
+  printf "  disk:    ${BOLD}%s${RESET} / %s host free\n" "$(mib_to_human "$l_disk")" "$(mib_to_human "$h_disk")"
+  draw_bar "$l_disk_pct"
+
+  if [ "$l_status" != "running" ]; then
+    printf "\n  ${DIM}lima VM is stopped — microVM details unavailable${RESET}\n"
+    printf "  ${DIM}run: fire vm start${RESET}\n\n"
+    return 0
+  fi
+
+  # --- layer 3: microVMs (query from inside the VM) ---
+  sync_fcctl
+  printf "\n"
+  limactl shell "$LIMA_VM" -- sudo /usr/local/bin/fcctl resources
+}
+
+# --- resize (microVM) -------------------------------------------------
+
+cmd_resize() {
+  require_jq
+  ensure_vm
+  sync_fcctl
+  limactl shell "$LIMA_VM" -- sudo /usr/local/bin/fcctl resize "$@"
+}
+
+# --- vm management ----------------------------------------------------
+
+cmd_vm() {
+  local action="${1:-}"
+  shift 2>/dev/null || true
+
+  require_lima
+  case "$action" in
+    start)    _vm_start ;;
+    stop)     _vm_stop ;;
+    delete)   _vm_delete ;;
+    shell)    _vm_shell ;;
+    status)   _vm_status ;;
+    resize)   require_jq; _vm_resize "$@" ;;
+    *)
+      cat <<EOF
+${BOLD}usage:${RESET} fire vm <command>
+
+  fire vm start                              start the lima host VM
+  fire vm stop                               stop the lima host VM (kills all microVMs!)
+  fire vm delete                             delete the lima host VM entirely
+  fire vm shell                              drop into the lima VM shell
+  fire vm status                             show lima VM info
+  fire vm resize [--cpus N] [--mem N] [--disk N]   resize lima VM
+EOF
+      [ -n "$action" ] && exit 1
+      ;;
+  esac
+}
+
+_vm_start() {
+  vm_exists || die "VM does not exist — run: fire setup"
+  if vm_running; then
+    ok "VM is already running"
+    return 0
+  fi
+  log "starting lima VM '${LIMA_VM}'"
+  limactl start "$LIMA_VM"
+  limactl shell "$LIMA_VM" -- sudo chmod 666 /dev/kvm 2>/dev/null || true
+  ok "VM started"
+}
+
+_vm_stop() {
+  if ! vm_running; then
+    warn "VM is not running"
+    return 0
+  fi
+  log "stopping lima VM '${LIMA_VM}'"
+  warn "this will kill all running microVMs"
+  limactl stop "$LIMA_VM"
+  ok "VM stopped"
+}
+
+_vm_delete() {
+  if ! vm_exists; then
+    warn "VM does not exist"
+    return 0
+  fi
+  log "deleting lima VM '${LIMA_VM}'"
+  limactl delete "$LIMA_VM" --force
+  ok "VM deleted"
+}
+
+_vm_shell() {
+  ensure_vm
+  exec limactl shell "$LIMA_VM"
+}
+
+_vm_status() {
+  if ! vm_exists; then
+    printf "  ${DIM}VM does not exist${RESET}\n"
+    return 0
+  fi
+  limactl list | head -1
+  limactl list | grep "$LIMA_VM"
+}
+
+# --- vm resize --------------------------------------------------------
+# the scary one. modifies lima.yaml, requires full VM restart.
+# must validate:
+#   1. new values fit within host constraints
+#   2. existing microVM allocations still fit after resize
+
+_vm_resize() {
+  vm_exists || die "VM does not exist — run: fire setup"
+
+  local new_cpus="" new_mem="" new_disk="" force=false
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --cpus)  shift; new_cpus="${1:?--cpus requires a value}" ;;
+      --mem)   shift; new_mem="${1:?--mem requires a value}" ;;
+      --disk)  shift; new_disk="${1:?--disk requires a value}" ;;
+      --yes|-y) force=true ;;
+      -*)      die "unknown flag: $1" ;;
+      *)       die "unexpected arg: $1" ;;
+    esac
+    shift
+  done
+
+  local cur_cpus; cur_cpus=$(lima_cpus)
+  local cur_mem;  cur_mem=$(lima_mem_mib)
+  local cur_disk; cur_disk=$(lima_disk_mib)
+
+  # if nothing requested, show current
+  if [ -z "$new_cpus" ] && [ -z "$new_mem" ] && [ -z "$new_disk" ]; then
+    printf "${BOLD}lima VM '${LIMA_VM}'${RESET} — current allocation:\n"
+    printf "  cpus:    ${BOLD}%s${RESET}\n" "$cur_cpus"
+    printf "  memory:  ${BOLD}%s${RESET}\n" "$(mib_to_human "$cur_mem")"
+    printf "  disk:    ${BOLD}%s${RESET}\n" "$(mib_to_human "$cur_disk")"
+    printf "\n  ${DIM}use --cpus, --mem, --disk to change${RESET}\n"
+    return 0
+  fi
+
+  # fill unchanged
+  [ -z "$new_cpus" ] && new_cpus="$cur_cpus"
+  [ -z "$new_mem" ]  && new_mem="$cur_mem"
+  [ -z "$new_disk" ] && new_disk="$cur_disk"
+
+  is_int "$new_cpus" || die "cpus must be an integer"
+  is_int "$new_mem"  || die "mem must be an integer (MiB)"
+  is_int "$new_disk" || die "disk must be an integer (MiB)"
+
+  # --- constraint layer 1: host limits ---
+  local h_cpus; h_cpus=$(host_cpus)
+  local h_mem;  h_mem=$(host_mem_mib)
+  local errors=0
+
+  if [ "$new_cpus" -gt "$h_cpus" ]; then
+    err "cpus=${new_cpus} exceeds host physical cores (${h_cpus})"
+    errors=$((errors + 1))
+  fi
+  if [ "$new_cpus" -lt "$MIN_LIMA_CPUS" ]; then
+    err "cpus=${new_cpus} below minimum (${MIN_LIMA_CPUS})"
+    errors=$((errors + 1))
+  fi
+
+  local host_allocatable=$(( h_mem - HOST_RESERVE_MIB ))
+  if [ "$new_mem" -gt "$host_allocatable" ]; then
+    err "mem=$(mib_to_human "$new_mem") exceeds host allocatable ($(mib_to_human "$host_allocatable"))"
+    err "  host total: $(mib_to_human "$h_mem"), reserved for macOS: $(mib_to_human $HOST_RESERVE_MIB)"
+    errors=$((errors + 1))
+  fi
+  if [ "$new_mem" -lt "$MIN_LIMA_MEM_MIB" ]; then
+    err "mem=$(mib_to_human "$new_mem") below minimum ($(mib_to_human $MIN_LIMA_MEM_MIB))"
+    errors=$((errors + 1))
+  fi
+
+  if [ "$new_disk" -lt "$MIN_LIMA_DISK_MIB" ]; then
+    err "disk=$(mib_to_human "$new_disk") below minimum ($(mib_to_human $MIN_LIMA_DISK_MIB))"
+    errors=$((errors + 1))
+  fi
+  # disk can only grow in lima (vz backend limitation)
+  if [ "$new_disk" -lt "$cur_disk" ]; then
+    err "disk shrink not supported by lima/vz (current: $(mib_to_human "$cur_disk"), requested: $(mib_to_human "$new_disk"))"
+    errors=$((errors + 1))
+  fi
+
+  [ "$errors" -gt 0 ] && die "host constraint violation — cannot proceed"
+
+  # --- constraint layer 2: do existing microVMs still fit? ---
+  if vm_running; then
+    sync_fcctl
+    local alloc_mem; alloc_mem=$(limactl shell "$LIMA_VM" -- sudo /usr/local/bin/fcctl _sum_mem 2>/dev/null) || alloc_mem=0
+    local alloc_cpus; alloc_cpus=$(limactl shell "$LIMA_VM" -- sudo /usr/local/bin/fcctl _sum_cpus 2>/dev/null) || alloc_cpus=0
+
+    local new_ceiling=$(( new_mem - LIMA_OS_RESERVE_MIB ))
+    if [ -n "$alloc_mem" ] && [ "$alloc_mem" -gt 0 ] && [ "$alloc_mem" -gt "$new_ceiling" ]; then
+      err "existing microVMs use ${alloc_mem}M RAM but new lima ceiling would be ${new_ceiling}M"
+      err "  new lima mem: $(mib_to_human "$new_mem") - $(mib_to_human $LIMA_OS_RESERVE_MIB) OS reserve = $(mib_to_human "$new_ceiling") allocatable"
+      err "  stop or resize microVMs first, then shrink lima"
+      die "would OOM existing microVMs — cannot proceed"
+    fi
+
+    if [ -n "$alloc_cpus" ] && [ "$alloc_cpus" -gt "$new_cpus" ]; then
+      warn "existing microVMs have ${alloc_cpus} vCPUs allocated but lima will only have ${new_cpus} cores (overcommit)"
+    fi
+  fi
+
+  # --- show diff ---
+  local has_change=false
+  printf "\n  ${BOLD}lima VM resize plan:${RESET}\n"
+  if [ "$new_cpus" != "$cur_cpus" ]; then
+    printf "  cpus:    %s → ${BOLD}%s${RESET}\n" "$cur_cpus" "$new_cpus"
+    has_change=true
+  fi
+  if [ "$new_mem" != "$cur_mem" ]; then
+    printf "  memory:  %s → ${BOLD}%s${RESET}\n" "$(mib_to_human "$cur_mem")" "$(mib_to_human "$new_mem")"
+    has_change=true
+  fi
+  if [ "$new_disk" != "$cur_disk" ]; then
+    printf "  disk:    %s → ${BOLD}%s${RESET}\n" "$(mib_to_human "$cur_disk")" "$(mib_to_human "$new_disk")"
+    has_change=true
+  fi
+
+  if [ "$has_change" = false ]; then
+    ok "nothing to change"
+    return 0
+  fi
+
+  local was_running=false
+  vm_running && was_running=true
+
+  if [ "$was_running" = true ]; then
+    printf "\n"
+    warn "this requires stopping the lima VM (all running microVMs will be killed)"
+
+    if [ "$force" = true ]; then
+      log "skipping confirmation (--yes)"
+    else
+      printf "  ${BOLD}proceed? [y/N]${RESET} "
+      local confirm
+      read -r confirm </dev/tty || confirm=""
+      case "$confirm" in
+        y|Y|yes|YES) ;;
+        *) die "aborted" ;;
+      esac
+    fi
+
+    log "stopping lima VM"
+    limactl stop "$LIMA_VM"
+  fi
+
+  # --- apply to lima.yaml ---
+  local yaml; yaml=$(lima_yaml_path)
+  [ -f "$yaml" ] || die "lima.yaml not found at ${yaml}"
+
+  log "updating lima.yaml"
+
+  # helper: set or replace a top-level key in the yaml.
+  # lima yaml uses `key: value` or `key: null`. we handle both.
+  _yaml_set() {
+    local key="$1" val="$2" file="$3"
+    if grep -qE "^${key}:" "$file"; then
+      sed -i '' "s/^${key}:.*/${key}: ${val}/" "$file"
+    else
+      # insert after the comment block at top
+      printf '%s: %s\n' "$key" "$val" >> "$file"
+    fi
+  }
+
+  _yaml_set "cpus" "$new_cpus" "$yaml"
+  _yaml_set "memory" "\"${new_mem}MiB\"" "$yaml"
+  _yaml_set "disk" "\"${new_disk}MiB\"" "$yaml"
+
+  ok "lima.yaml updated (cpus=${new_cpus}, mem=${new_mem}M, disk=${new_disk}M)"
+
+  if [ "$was_running" = true ]; then
+    log "restarting lima VM"
+    limactl start "$LIMA_VM"
+    limactl shell "$LIMA_VM" -- sudo chmod 666 /dev/kvm 2>/dev/null || true
+    ok "VM restarted with new resources"
+    printf "\n"
+    warn "all microVMs were stopped — restart them with: fire start <name>"
+  else
+    printf "\n"
+    log "changes applied. start the VM with: fire vm start"
+  fi
+}
+
+# --- version ----------------------------------------------------------
+
+cmd_version() {
+  printf "${BOLD}fire${RESET} — firecracker on macOS via lima\n"
+  printf "  repo:         ${REPO_DIR}\n"
+  printf "  chip:         $(host_chip)\n"
+  printf "  lima vm:      ${LIMA_VM}\n"
+
+  # check deps without dying
+  local has_lima=false has_jq=false
+  command -v limactl &>/dev/null && has_lima=true
+  command -v jq &>/dev/null && has_jq=true
+
+  if [ "$has_lima" = false ]; then
+    printf "  lima:         ${RED}not installed${RESET}  ${DIM}(brew install lima)${RESET}\n"
+  elif [ "$has_jq" = false ]; then
+    printf "  jq:           ${RED}not installed${RESET}  ${DIM}(brew install jq)${RESET}\n"
+  fi
+
+  if [ "$has_lima" = true ] && vm_running 2>/dev/null; then
+    local fc_ver
+    fc_ver=$(limactl shell "$LIMA_VM" -- firecracker --version 2>/dev/null | head -1) || fc_ver="unknown"
+    printf "  firecracker:  ${fc_ver}\n"
+    printf "  vm status:    ${GREEN}running${RESET}\n"
+  elif [ "$has_lima" = true ] && vm_exists 2>/dev/null; then
+    printf "  vm status:    ${DIM}stopped${RESET}\n"
+  else
+    printf "  vm status:    ${DIM}not created${RESET}\n"
+  fi
+}
+
+# --- usage ------------------------------------------------------------
+
+usage() {
+  cat <<EOF
+${BOLD}fire${RESET} — run firecracker microVMs on macOS
+
+${BOLD}setup:${RESET}
+  fire setup                                     bootstrap lima VM with firecracker
+
+${BOLD}microVM lifecycle:${RESET}
+  fire create  <name> [vcpus] [mem] [disk]       create a VM (default: 2 cpu, 512M, 2G disk)
+  fire start   <name>                             start a VM
+  fire stop    <name>                             stop a VM
+  fire ssh     <name> [cmd...]                    ssh into a VM
+  fire destroy <name>                             delete a VM
+
+${BOLD}microVM introspection:${RESET}
+  fire status  [name]                             show VM status
+  fire list                                       list all VMs
+  fire logs    <name> [-f]                        view console log
+
+${BOLD}resource management:${RESET}
+  fire resources                                  3-layer resource dashboard
+  fire resize  <name> [--cpus N] [--mem N] [--disk N]
+                                                  resize a microVM (must be stopped)
+
+${BOLD}lima host VM:${RESET}
+  fire vm start                                   start the lima host VM
+  fire vm stop                                    stop it (kills all microVMs!)
+  fire vm delete                                  delete everything
+  fire vm shell                                   drop into lima shell
+  fire vm status                                  show lima VM info
+  fire vm resize [--cpus N] [--mem N] [--disk N] [--yes]
+                                                  resize lima VM
+
+${BOLD}other:${RESET}
+  fire version                                    show version info
+  fire help                                       this message
+EOF
+}
+
+# --- main -------------------------------------------------------------
+
+main() {
+  local cmd="${1:-help}"
+  shift 2>/dev/null || true
+
+  case "$cmd" in
+    setup)                      cmd_setup ;;
+    vm)                         cmd_vm "$@" ;;
+    resources|res|top)          cmd_resources ;;
+    resize)                     cmd_resize "$@" ;;
+    version|--version|-v)       cmd_version ;;
+    help|-h|--help)             usage ;;
+    create|start|stop|ssh|status|list|ls|logs|destroy)
+      require_jq
+      run_fcctl "$cmd" "$@"
+      ;;
+    *)
+      err "unknown command: ${cmd}"
+      printf "\n"
+      usage
+      exit 1
+      ;;
+  esac
+}
+
+main "$@"

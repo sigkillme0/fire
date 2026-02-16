@@ -1,0 +1,152 @@
+# lima VM template for running firecracker on macOS (apple silicon)
+# requires: macOS with Apple Silicon (M3+ for nested virtualization)
+# usage: limactl create --name firecracker lima/firecracker.yaml
+
+images:
+  - location: "https://cloud-images.ubuntu.com/releases/24.04/release/ubuntu-24.04-server-cloudimg-arm64.img"
+    arch: "aarch64"
+
+arch: "aarch64"
+
+vmType: "vz"
+rosetta:
+  enabled: false
+
+nestedVirtualization: true
+
+cpus: 4
+memory: "8GiB"
+disk: "50GiB"
+
+mountType: "virtiofs"
+mounts:
+  - location: "~"
+    writable: true
+  - location: "/tmp/lima"
+    writable: true
+
+networks:
+  - vzNAT: true
+
+provision:
+  - mode: system
+    script: |
+      #!/bin/bash
+      set -eux -o pipefail
+
+      # unset lima's broken proxy vars
+      unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY
+
+      export DEBIAN_FRONTEND=noninteractive
+
+      # install dependencies
+      apt-get update -qq
+      apt-get install -y -qq \
+        dnsmasq \
+        tinyproxy \
+        sshpass \
+        apparmor-utils \
+        squashfs-tools \
+        curl \
+        jq \
+        iproute2 \
+        iptables \
+        net-tools \
+        > /dev/null
+
+      # put tinyproxy in complain mode so it doesn't block our configs
+      aa-complain tinyproxy 2>/dev/null || true
+
+      # stop system-wide dnsmasq — we run per-VM instances
+      systemctl stop dnsmasq 2>/dev/null || true
+      systemctl disable dnsmasq 2>/dev/null || true
+
+      # stop system-wide tinyproxy — we run per-VM instances
+      systemctl stop tinyproxy 2>/dev/null || true
+      systemctl disable tinyproxy 2>/dev/null || true
+
+      # create firecracker directories
+      mkdir -p /srv/firecracker
+      mkdir -p /opt/firecracker
+
+      # install firecracker binary
+      ARCH=$(uname -m)
+      FC_VERSION="v1.14.1"
+      FC_URL="https://github.com/firecracker-microvm/firecracker/releases/download/${FC_VERSION}/firecracker-${FC_VERSION}-${ARCH}.tgz"
+
+      if [ ! -f /usr/local/bin/firecracker ]; then
+        curl -sL "${FC_URL}" | tar xz -C /tmp
+        cp "/tmp/release-${FC_VERSION}-${ARCH}/firecracker-${FC_VERSION}-${ARCH}" /usr/local/bin/firecracker
+        cp "/tmp/release-${FC_VERSION}-${ARCH}/jailer-${FC_VERSION}-${ARCH}" /usr/local/bin/jailer
+        chmod +x /usr/local/bin/firecracker /usr/local/bin/jailer
+        rm -rf /tmp/release-*
+      fi
+
+      # download kernel
+      if [ ! -f /opt/firecracker/vmlinux ]; then
+        curl -sL "https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/v1.14-def/${ARCH}/vmlinux-6.1.150" \
+          -o /opt/firecracker/vmlinux
+      fi
+
+      # download and convert rootfs
+      if [ ! -f /opt/firecracker/rootfs.ext4 ]; then
+        curl -sL "https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/v1.14-def/${ARCH}/ubuntu-24.04.squashfs" \
+          -o /tmp/ubuntu.squashfs
+
+        unsquashfs -d /tmp/rootfs_dir /tmp/ubuntu.squashfs
+
+        dd if=/dev/zero of=/opt/firecracker/rootfs.ext4 bs=1M count=2048
+        mkfs.ext4 -F /opt/firecracker/rootfs.ext4
+
+        mkdir -p /tmp/rootfs_mount
+        mount /opt/firecracker/rootfs.ext4 /tmp/rootfs_mount
+        cp -a /tmp/rootfs_dir/* /tmp/rootfs_mount/
+
+        # set root password to "root"
+        HASH=$(openssl passwd -6 root)
+        sed -i "s|^root:[^:]*:|root:${HASH}:|" /tmp/rootfs_mount/etc/shadow
+
+        # enable root login via ssh
+        mkdir -p /tmp/rootfs_mount/etc/ssh/sshd_config.d
+        echo 'PermitRootLogin yes' > /tmp/rootfs_mount/etc/ssh/sshd_config.d/99-firecracker.conf
+
+        umount /tmp/rootfs_mount
+        rm -rf /tmp/rootfs_dir /tmp/ubuntu.squashfs /tmp/rootfs_mount
+      fi
+
+      # ensure kvm group and permissions
+      if [ -e /dev/kvm ]; then
+        chmod 666 /dev/kvm
+      fi
+
+probes:
+  - description: "firecracker binary installed"
+    script: |
+      #!/bin/bash
+      test -f /usr/local/bin/firecracker
+    hint: "firecracker binary not found — provisioning may have failed"
+
+  - description: "kernel and rootfs ready"
+    script: |
+      #!/bin/bash
+      test -f /opt/firecracker/vmlinux && test -f /opt/firecracker/rootfs.ext4
+    hint: "kernel or rootfs not found — provisioning may have failed"
+
+  - description: "kvm available"
+    script: |
+      #!/bin/bash
+      test -e /dev/kvm
+    hint: |
+      /dev/kvm not found. nested virtualization may not be supported.
+      requires Apple Silicon M3 or later.
+
+message: |
+  firecracker is ready.
+
+  to use:
+    fire create <name> [vcpus] [mem_mib]
+    fire start <name>
+    fire ssh <name>
+    fire stop <name>
+    fire destroy <name>
+    fire list

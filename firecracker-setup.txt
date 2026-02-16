@@ -1,0 +1,527 @@
+FIRECRACKER ON APPLE SILICON VIA LIMA - COMPLETE SETUP DOCUMENTATION
+=====================================================================
+date:     2026-02-15
+host:     macOS Darwin 25.3.0, Apple Silicon (aarch64)
+lima:     limactl with VM "mvm"
+guest OS: Ubuntu 25.10 (Questing Quokka) aarch64
+kernel:   6.17.0-8-generic (lima host VM), 6.1.150 (firecracker guest)
+fc ver:   Firecracker v1.14.1
+
+
+1. THE PROBLEM
+==============
+
+firecracker requires KVM. macOS doesn't have KVM. the path is:
+
+    macOS (Apple Silicon)
+      -> Lima VM (Virtualization.framework / "vz" backend)
+        -> KVM (nested virtualization)
+          -> Firecracker microVM
+
+the lima VM "mvm" was already running but had no /dev/kvm because
+nested virtualization was not enabled. dmesg showed:
+
+    kvm [1]: HYP mode not available
+
+additionally, VZ (Virtualization.framework) has a critical networking
+limitation that affected the entire design. more on that below.
+
+
+2. ENABLING KVM (NESTED VIRTUALIZATION)
+=======================================
+
+lima config location: ~/.lima/mvm/lima.yaml
+
+the VM uses vmType "vz" (Virtualization.framework), which supports
+nested virtualization on Apple M3+ chips. the config had:
+
+    nestedVirtualization: null    (defaults to false)
+
+fix:
+    limactl stop mvm
+    # edit ~/.lima/mvm/lima.yaml:
+    nestedVirtualization: true
+    limactl start mvm
+
+after restart, dmesg confirms:
+
+    kvm [1]: Hyp nVHE mode initialized successfully
+
+/dev/kvm appears as:
+
+    crw-rw---- 1 root kvm 10, 232 ... /dev/kvm
+
+the user "segfault" was added to the kvm group:
+
+    sudo usermod -aG kvm segfault
+
+note: group changes require a new login session. the fcctl script
+works around this by chmod 666 /dev/kvm on each start. acceptable
+inside a VM that's already isolated. would not do this on bare metal.
+
+
+3. INSTALLING FIRECRACKER
+=========================
+
+binary source: github releases
+    https://github.com/firecracker-microvm/firecracker/releases/tag/v1.14.1
+
+download & install:
+    ARCH=$(uname -m)  # aarch64
+    curl -sL "https://github.com/firecracker-microvm/firecracker/releases/\
+    download/v1.14.1/firecracker-v1.14.1-${ARCH}.tgz" | tar xz
+    sudo cp release-v1.14.1-aarch64/firecracker-v1.14.1-aarch64 /usr/local/bin/firecracker
+    sudo cp release-v1.14.1-aarch64/jailer-v1.14.1-aarch64 /usr/local/bin/jailer
+
+installed at:
+    /usr/local/bin/firecracker
+    /usr/local/bin/jailer
+
+NOTE on proxy: the lima VM had a broken proxy env var (http_proxy='http://')
+set by lima's host integration. all curl commands inside the VM need:
+    unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY
+
+
+4. KERNEL AND ROOTFS
+====================
+
+4a. KERNEL
+----------
+source: firecracker CI artifacts on S3
+bucket: s3://spec.ccfc.min
+
+the URL structure changed from earlier docs. the correct path for v1.14 is:
+    firecracker-ci/v1.14-def/<arch>/vmlinux-<version>
+
+NOT the old format:
+    firecracker-ci/v1.14/<arch>/vmlinux-<version>    (404 / NoSuchKey)
+
+discovery method: S3 ListObjects API
+    curl "https://s3.amazonaws.com/spec.ccfc.min?list-type=2&prefix=firecracker-ci/v1.14&max-keys=50"
+
+kernel used:
+    https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/v1.14-def/aarch64/vmlinux-6.1.150
+    size: 16,837,120 bytes
+    type: Linux kernel ARM64 boot executable Image, little-endian, 4K pages
+
+installed at: ~/firecracker/vmlinux
+
+
+4b. ROOTFS
+----------
+the CI bucket only had squashfs images, not ext4:
+    firecracker-ci/v1.14-def/aarch64/ubuntu-24.04.squashfs (105MB)
+
+firecracker requires a raw block device (ext4), not squashfs.
+
+conversion process:
+    sudo unsquashfs -d /tmp/rootfs_dir /tmp/ubuntu-24.04.squashfs
+    dd if=/dev/zero of=rootfs.ext4 bs=1M count=2048
+    mkfs.ext4 rootfs.ext4
+    sudo mount rootfs.ext4 /tmp/rootfs_mount
+    sudo cp -a /tmp/rootfs_dir/* /tmp/rootfs_mount/
+    sudo umount /tmp/rootfs_mount
+
+the initial 512MB image was 92% full. upgraded to 2GB (25% used).
+
+guest OS: Ubuntu 24.04.3 LTS (Noble Numbat) aarch64
+
+rootfs modifications:
+    - root password set via: openssl passwd -6 root -> written to /etc/shadow
+    - /etc/ssh/sshd_config: PermitRootLogin yes
+    - /etc/hostname: set per-VM
+    - /etc/systemd/network/20-eth0.network: static IP config
+    - /etc/resolv.conf: points to host-side dnsmasq
+    - /etc/environment: proxy settings for internet access
+
+installed at: ~/firecracker/rootfs.ext4 (2GB, base image)
+per-VM copies at: /srv/firecracker/<name>/rootfs.ext4
+
+
+5. NETWORKING - THE HARD PART
+=============================
+
+5a. THE VZ NETWORKING PROBLEM
+-----------------------------
+this was the biggest issue and took the most debugging time.
+
+lima's VZ backend uses Apple's Virtualization.framework, which creates
+a NAT network (192.168.5.0/24) with a gateway at 192.168.5.2.
+
+the standard firecracker networking approach is:
+    1. create a TAP device on the host
+    2. assign it to the firecracker guest
+    3. use iptables MASQUERADE to NAT guest traffic through the host's eth0
+
+this DOES NOT WORK with VZ networking.
+
+what happens:
+    - guest sends TCP SYN via tap0
+    - iptables MASQUERADE translates source to 192.168.5.15 (host IP)
+    - SYN appears on eth0 with correct checksum (verified via tcpdump -v)
+    - NO SYN-ACK ever returns
+
+but:
+    - ICMP ping works fine (guest can ping 8.8.8.8)
+    - direct TCP from the host works fine
+    - TCP from guest to host (172.16.x.1) works fine
+
+root cause: the VZ/vmnet network layer drops kernel-forwarded TCP packets.
+it only allows TCP that was originated by the VM's own TCP stack. the
+forwarded packets have the same source IP but were not tracked by VZ's
+internal connection tracker. ICMP is stateless so it passes through.
+
+evidence:
+    - tcpdump on eth0 shows SYN going out, no response
+    - tcpdump checksums are correct: "cksum 0x779b (correct)"
+    - TTL on forwarded packets is 126 (decremented twice: guest->host->eth0)
+      vs TTL 64 for host-originated traffic
+    - direct TCP from host to same destination works instantly
+
+
+5b. ATTEMPTED SOLUTIONS THAT FAILED
+------------------------------------
+1. iptables MASQUERADE (standard approach)
+   result: SYN goes out, no SYN-ACK returns. VZ drops forwarded packets.
+
+2. bridge mode (br0 with eth0 + tap0)
+   result: guest gets IP in same subnet (192.168.5.100). ICMP works.
+   TCP still fails because VZ gateway filters by MAC address or
+   connection tracking.
+
+3. checksum offload disable (ethtool -K tap0 tx off rx off)
+   result: no effect. checksums were already correct.
+
+
+5c. SOLUTION: USERSPACE PROXY
+------------------------------
+since VZ only allows locally-originated TCP from the host, the solution
+is to proxy all guest traffic through userspace processes on the host.
+the host makes the connections itself (locally originated) so VZ allows them.
+
+components:
+    - dnsmasq: DNS forwarder on host tap interface -> 8.8.8.8
+    - tinyproxy: HTTP/HTTPS proxy on host tap interface
+
+the guest is configured with:
+    http_proxy=http://<host_ip>:<port>
+    https_proxy=http://<host_ip>:<port>
+
+traffic flow:
+    guest curl -> HTTP CONNECT to tinyproxy on host -> host makes real TCP
+    connection -> VZ NATs to internet -> response back through same path
+
+this means:
+    - HTTP works (proxy mode)
+    - HTTPS works (CONNECT tunnel mode)
+    - DNS works (dnsmasq forwards queries)
+    - raw TCP to arbitrary ports does NOT work (would need socat relays)
+    - apt-get works (uses HTTP proxy)
+
+NOTE: tinyproxy on ubuntu 24.04 has an apparmor profile that restricts
+config file reads to /etc/tinyproxy/. config files MUST be in that directory
+or tinyproxy will fail with EACCES even when run as root. this was found
+via strace showing openat() returning EACCES after apparmor mediation.
+
+NOTE: tinyproxy initially returned 403 on HTTPS CONNECT requests because
+the config had "ConnectPort 0" which means "allow port 0 only", not
+"allow all ports". removing ConnectPort entirely allows all ports.
+
+
+5d. NETWORK ADDRESSING
+-----------------------
+initial design used a shared /24 (172.16.0.0/24) for all VMs. this broke
+multi-VM because all tap devices were on the same subnet, causing routing
+ambiguity.
+
+final design: per-VM /30 point-to-point subnets.
+
+    VM "foo" with vm_id=148:
+        tap148:  172.16.148.1/30  (host side)
+        guest:   172.16.148.2/30  (firecracker guest)
+        dnsmasq: 172.16.148.1:53
+        proxy:   172.16.148.1:9036  (8888 + vm_id)
+
+    VM "bar" with vm_id=20:
+        tap20:   172.16.20.1/30   (host side)
+        guest:   172.16.20.2/30   (firecracker guest)
+        dnsmasq: 172.16.20.1:53
+        proxy:   172.16.20.1:8908  (8888 + vm_id)
+
+vm_id is derived from name via: cksum | mod 253 + 1
+this gives deterministic, collision-resistant IDs from 1-253.
+
+each VM gets its own:
+    - tap device
+    - dnsmasq instance (separate PID file)
+    - tinyproxy instance (separate config file)
+
+
+6. FCCTL - MANAGEMENT SCRIPT
+=============================
+
+location (in VM): ~/firecracker/fcctl -> symlinked to /usr/local/bin/fcctl
+location (host):  ~/Reality/fcctl
+
+usage:
+    fcctl create <name> [vcpus] [mem_mib]   # default: 2 cpu, 512MB
+    fcctl start <name>
+    fcctl stop <name>
+    fcctl status [name]
+    fcctl ssh <name> [command...]
+    fcctl destroy <name>
+    fcctl list
+
+what "create" does:
+    1. derives vm_id from name hash
+    2. creates /srv/firecracker/<name>/
+    3. copies base rootfs (2GB ext4) to VM directory
+    4. mounts rootfs and configures:
+       - static IP (systemd-networkd)
+       - DNS resolver (points to host dnsmasq)
+       - hostname
+       - proxy environment variables
+    5. writes firecracker vm_config.json
+    6. writes metadata file (name, id, ips, ports, created timestamp)
+
+what "start" does:
+    1. loads VM metadata
+    2. creates tap device if not exists (/30 subnet)
+    3. starts dnsmasq if not running (per-tap, bind-interfaces)
+    4. starts tinyproxy if not running (per-tap, apparmor-safe path)
+    5. ensures /dev/kvm is accessible
+    6. launches firecracker with API socket + config file
+    7. writes PID file
+    8. polls with ping until guest responds (timeout: 30s)
+
+what "stop" does:
+    1. attempts graceful shutdown via API (SendCtrlAltDel - not supported
+       on aarch64, but tried anyway for forward compat)
+    2. SIGTERM to firecracker process
+    3. SIGKILL if still alive after 1s
+    4. kills associated dnsmasq and tinyproxy
+    5. removes PID file
+
+what "destroy" does:
+    1. calls stop
+    2. deletes tap device
+    3. removes tinyproxy config
+    4. removes dnsmasq PID file
+    5. rm -rf the VM directory
+
+
+7. FILE LAYOUT
+==============
+
+on the lima VM (mvm):
+
+    ~/firecracker/
+        fcctl               management script
+        vmlinux             kernel (6.1.150 arm64, 16MB)
+        rootfs.ext4         base rootfs (ubuntu 24.04, 2GB)
+
+    /srv/firecracker/
+        <vm-name>/
+            rootfs.ext4     per-VM rootfs copy
+            vm_config.json  firecracker config
+            metadata        VM metadata (name, ips, ports, etc)
+            pid             PID of running firecracker process
+            console.log     serial console output
+            firecracker.socket  API socket
+
+    /etc/tinyproxy/
+        tinyproxy-tap<id>.conf   per-VM proxy config
+
+    /run/
+        dnsmasq-tap<id>.pid      per-VM DNS PID file
+
+    /usr/local/bin/
+        firecracker         firecracker binary (v1.14.1 aarch64)
+        jailer              jailer binary (v1.14.1 aarch64, unused)
+        fcctl               symlink to ~/firecracker/fcctl
+
+
+8. FIRECRACKER VM CONFIG FORMAT
+===============================
+
+each VM gets a vm_config.json:
+
+    {
+      "boot-source": {
+        "kernel_image_path": "/home/segfault.linux/firecracker/vmlinux",
+        "boot_args": "console=ttyS0 reboot=k panic=1 pci=off init=/sbin/init"
+      },
+      "drives": [{
+        "drive_id": "rootfs",
+        "path_on_host": "/srv/firecracker/<name>/rootfs.ext4",
+        "is_root_device": true,
+        "is_read_only": false
+      }],
+      "network-interfaces": [{
+        "iface_id": "eth0",
+        "guest_mac": "AA:FC:00:00:00:<hex_vm_id>",
+        "host_dev_name": "tap<vm_id>"
+      }],
+      "machine-config": {
+        "vcpu_count": <N>,
+        "mem_size_mib": <N>
+      }
+    }
+
+boot_args explained:
+    console=ttyS0     serial console output (captured to console.log)
+    reboot=k          use keyboard controller for reboot
+    panic=1           reboot 1s after kernel panic
+    pci=off           no PCI bus (firecracker uses virtio-mmio)
+    init=/sbin/init   use systemd as init
+
+
+9. PERFORMANCE
+==============
+
+boot time: ~6 seconds (from firecracker start to guest responding to ping)
+
+this includes:
+    - kernel decompression and init
+    - systemd startup
+    - systemd-networkd bringing up eth0
+    - SSH socket activation
+
+ping latency (host to guest): 1-3ms
+HTTP via proxy: ~300ms (includes proxy overhead + TLS)
+HTTPS via CONNECT proxy: ~350-500ms
+
+
+10. KNOWN LIMITATIONS
+=====================
+
+1. NO JAILER
+   the jailer binary is installed but not used. ubuntu 24.04's apparmor
+   profile for various services conflicts with jailer's chroot approach.
+   firecracker runs as the regular user, not in a restricted sandbox.
+   acceptable for development. not for production.
+
+2. PROXY-ONLY TCP
+   because VZ drops kernel-forwarded TCP, all guest internet access goes
+   through the HTTP proxy (tinyproxy). this means:
+   - HTTP/HTTPS: works
+   - DNS: works (dnsmasq)
+   - raw TCP (databases, custom protocols): does NOT work
+   - UDP (besides DNS): does NOT work
+   to fix: switch lima to qemu backend instead of vz, or add per-service
+   socat relays for non-HTTP traffic.
+
+3. ROOT:ROOT SSH
+   guest VMs use password "root" for the root account. production would
+   use SSH key injection during rootfs creation.
+
+4. NO SYSTEMD PERSISTENCE
+   dnsmasq and tinyproxy are started ad-hoc by fcctl, not as systemd
+   services. they die on lima VM reboot. fcctl start recreates them
+   (idempotent), but running VMs are lost on reboot.
+
+5. NO SNAPSHOT/RESTORE
+   firecracker supports VM snapshots but this is not implemented in fcctl.
+
+6. NO RESOURCE LIMITS
+   no cgroup limits on firecracker processes beyond what's in the config.
+   a guest could theoretically consume all host CPU/IO.
+
+7. SendCtrlAltDel NOT SUPPORTED ON AARCH64
+   graceful VM shutdown via the firecracker API doesn't work on ARM.
+   VMs are killed with SIGTERM/SIGKILL. the guest filesystem may not
+   be cleanly unmounted.
+
+8. COLLISION RISK ON VM IDS
+   vm_id is derived from name hash mod 253. two different names could
+   collide. fcctl does not check for this. would need a registry file.
+
+
+11. HOW TO USE
+==============
+
+    # enter the lima VM
+    limactl shell mvm
+
+    # create a VM (2 vcpus, 512MB ram)
+    fcctl create myvm 2 512
+
+    # start it
+    fcctl start myvm
+
+    # ssh in
+    fcctl ssh myvm
+
+    # run a command
+    fcctl ssh myvm "uname -a"
+
+    # use internet (proxy is auto-configured in /etc/environment)
+    fcctl ssh myvm "source /etc/environment && export http_proxy https_proxy && curl https://example.com"
+
+    # list all VMs
+    fcctl list
+
+    # stop a VM
+    fcctl stop myvm
+
+    # destroy a VM (deletes everything)
+    fcctl destroy myvm
+
+
+12. HOW TO REPRODUCE FROM SCRATCH
+==================================
+
+prerequisites:
+    - macOS with Apple Silicon (M3+ for nested virt)
+    - lima installed (brew install lima)
+
+step 1: create lima VM with nested virtualization
+    limactl create --name mvm template://ubuntu-lts
+    # edit ~/.lima/mvm/lima.yaml:
+    #   nestedVirtualization: true
+    limactl start mvm
+
+step 2: install firecracker inside the VM
+    limactl shell mvm
+    ARCH=$(uname -m)
+    curl -sL "https://github.com/firecracker-microvm/firecracker/releases/\
+    download/v1.14.1/firecracker-v1.14.1-${ARCH}.tgz" | tar xz -C /tmp
+    sudo cp /tmp/release-v1.14.1-${ARCH}/firecracker-v1.14.1-${ARCH} /usr/local/bin/firecracker
+    sudo cp /tmp/release-v1.14.1-${ARCH}/jailer-v1.14.1-${ARCH} /usr/local/bin/jailer
+    sudo chmod +x /usr/local/bin/firecracker /usr/local/bin/jailer
+
+step 3: download kernel
+    unset http_proxy https_proxy
+    mkdir -p ~/firecracker
+    curl -sL "https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/\
+    v1.14-def/${ARCH}/vmlinux-6.1.150" -o ~/firecracker/vmlinux
+
+step 4: build rootfs
+    curl -sL "https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/\
+    v1.14-def/${ARCH}/ubuntu-24.04.squashfs" -o /tmp/ubuntu.squashfs
+    sudo apt-get install -y squashfs-tools
+    sudo unsquashfs -d /tmp/rootfs_dir /tmp/ubuntu.squashfs
+    dd if=/dev/zero of=~/firecracker/rootfs.ext4 bs=1M count=2048
+    mkfs.ext4 ~/firecracker/rootfs.ext4
+    sudo mkdir -p /tmp/mnt && sudo mount ~/firecracker/rootfs.ext4 /tmp/mnt
+    sudo cp -a /tmp/rootfs_dir/* /tmp/mnt/
+    HASH=$(openssl passwd -6 root)
+    sudo sed -i "s|^root:[^:]*:|root:${HASH}:|" /tmp/mnt/etc/shadow
+    sudo bash -c "echo 'PermitRootLogin yes' >> /tmp/mnt/etc/ssh/sshd_config"
+    sudo umount /tmp/mnt
+
+step 5: install dependencies
+    sudo apt-get install -y dnsmasq tinyproxy sshpass apparmor-utils
+    sudo aa-complain tinyproxy
+    sudo usermod -aG kvm $(whoami)
+
+step 6: install fcctl
+    # copy fcctl script to ~/firecracker/fcctl
+    chmod +x ~/firecracker/fcctl
+    sudo ln -sf ~/firecracker/fcctl /usr/local/bin/fcctl
+    sudo mkdir -p /srv/firecracker
+
+step 7: use it
+    fcctl create myvm 2 512
+    fcctl start myvm
+    fcctl ssh myvm
