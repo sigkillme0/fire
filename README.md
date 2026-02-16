@@ -1,4 +1,4 @@
-# firecracker-macos
+# fire
 
 run [firecracker](https://github.com/firecracker-microvm/firecracker) microVMs on macOS apple silicon. no fuss.
 
@@ -35,8 +35,8 @@ fire setup              # one-time: creates lima VM, downloads firecracker (~5 m
 ### from source
 
 ```bash
-git clone https://github.com/sigkillme0/firecracker-macos.git
-cd firecracker-macos
+git clone https://github.com/sigkillme0/fire.git
+cd fire
 make setup              # installs deps, symlinks fire, creates lima VM (~5 min)
 ```
 
@@ -325,7 +325,7 @@ to host your own tap, create a repo named `homebrew-fire` with the formula:
 mkdir homebrew-fire && cd homebrew-fire
 git init
 mkdir Formula
-cp /path/to/firecracker-macos/Formula/fire.rb Formula/
+cp /path/to/fire/Formula/fire.rb Formula/
 
 # update the sha256 in the formula after tagging a release:
 shasum -a 256 /path/to/v1.0.0.tar.gz
@@ -340,7 +340,7 @@ then users install with `brew tap <you>/fire && brew install fire`.
 ## file layout
 
 ```
-firecracker-macos/
+fire/
 ├── README.md
 ├── Makefile                         # make install / make setup
 ├── Formula/
